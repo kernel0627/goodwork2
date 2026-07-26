@@ -1,0 +1,27 @@
+# 环境：conda `agent`（/Users/traegang/miniforge3/envs/agent，Python 3.10.20）
+#
+# 阶段 0 一个新库都没装。数据库直接用 stdlib sqlite3 手写 DDL：
+#   - 零新依赖
+#   - 对账项目里自己写 SQL 是加分项，不是减分项
+#   - 金额全部 INTEGER 分，不引入 ORM 的类型转换风险
+#
+# 装新东西前先问一句：这个能力用 stdlib 或已装的库能不能做？能就不装。
+# 每次真的装了，必须同步更新这个文件并在 STATUS.md 的变更日志里写一行。
+
+# ---- 阶段 0 实际用到的（环境里已存在，此处只做记录，无需安装）----
+click>=8.4          # CLI
+rich>=15.0          # 终端表格输出
+pytest>=9.1         # 测试
+
+# ---- 阶段 1 预计用到的（大概率仍然不用装）----
+# pandas>=2.3       # 出指标表；已装。也可以直接用 stdlib csv，视情况决定
+
+# ---- 阶段 2 起（Agent）预计用到的 ----
+# openai>=2.45      # 已装。用它的 SDK 配 base_url 打 DeepSeek / Qwen / 智谱，
+#                   # 不需要为每家再装一个 SDK
+#
+# 明确不打算引入：
+#   sqlalchemy      —— 手写 SQL 就够，且 SQL 本身是这个项目要展示的东西
+#   langchain 系列  —— harness 自己写，这是项目的核心卖点，不能外包给框架
+#   向量库          —— 政策文档只有 6 份，全文进 context 或关键词检索足够；
+#                      真需要检索时先用 stdlib 实现 BM25，证明不够用再说
