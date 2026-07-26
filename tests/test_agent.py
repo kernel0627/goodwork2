@@ -277,3 +277,108 @@ def test_diagnostics_helpers(world):
     results = [solver.run(t, EvidenceView(world)) for t in tasks]
     assert isinstance(tool_usage_stats(results), dict)
     assert sum(stop_reason_stats(results).values()) == len(results)
+
+
+# ------------------------------------------------------------ 消融配置
+
+def test_ablation_ladder_is_cumulative():
+    """阶梯必须是累积的：每一级只比上一级多开一个开关。
+    不累积的话「这个改动值多少个点」就读不出来了。"""
+    from recon.agent.config import ablation_ladder
+    flags = ("scope_boundary", "inline_sop", "dimension_checklist")
+    ladder = ablation_ladder("m")
+    prev: set[str] = set()
+    for cfg in ladder:
+        on = {f for f in flags if getattr(cfg, f)}
+        assert prev <= on, f"{cfg.name} 关掉了上一级开着的开关：{prev - on}"
+        assert len(on - prev) <= 1, f"{cfg.name} 一次多开了 {len(on - prev)} 个开关"
+        prev = on
+    assert not {f for f in flags if getattr(ladder[0], f)}, "第一级必须是全关的 v1 对照组"
+    assert prev == set(flags), "最后一级必须把所有开关都开上"
+
+
+def test_scope_boundary_flag_changes_prompt():
+    from recon.agent.config import AgentConfig
+    from recon.agent import prompts
+    off = prompts.system_prompt("(cat)", 14, AgentConfig("x"))
+    on = prompts.system_prompt("(cat)", 14, AgentConfig("x", scope_boundary=True))
+    assert "差错边界" not in off and "差错边界" in on
+    assert len(on) > len(off)
+
+
+def test_inline_sop_flag_embeds_the_document():
+    from recon.agent.config import AgentConfig
+    from recon.agent import prompts
+    on = prompts.system_prompt("(cat)", 14, AgentConfig("x", inline_sop=True))
+    assert "D21" in on and "延迟下发" in on
+    assert "不必再读它" in on, "内联后要明确告诉模型不用再 read_policy 取它"
+    off = prompts.system_prompt("(cat)", 14, AgentConfig("x"))
+    assert "不读政策就下结论" in off, "不内联时要引导它自己去读"
+
+
+def test_dimension_checklist_flag_lists_four_dimensions():
+    from recon.agent.config import AgentConfig
+    from recon.agent import prompts
+    on = prompts.system_prompt("(cat)", 14,
+                               AgentConfig("x", dimension_checklist=True))
+    for d in ("单边维度", "金额维度", "手续费维度", "归属维度"):
+        assert d in on
+    # 维度表不能变成「每个维度都算一个原因」的许可证
+    assert "≠" in on or "不等于" in on
+
+
+def test_runner_honours_config(one_task, world):
+    from recon.agent.config import AgentConfig
+    cfg = AgentConfig("t", scope_boundary=True, max_steps=3)
+    llm = FakeLLM([_conclude(["D01"], ["CHANNEL_INQUIRY"], "held")])
+    r = AgentRunner(llm, cfg=cfg).run(one_task, EvidenceView(world))
+    assert r.solution.root_causes == ["D01"]
+    sysmsg = llm.seen[0][0]["content"]
+    assert "差错边界" in sysmsg
+    assert "最多有 3 轮" in sysmsg
+
+
+# ------------------------------------------------------------ 方差与 pass^k
+
+def test_variance_analysis_computes_pass_k(world):
+    """pass^k 的定义必须是「k 次全对」，不是「平均正确率」。
+    两者混淆会系统性高估 agent 的可用程度。"""
+    from recon.eval.grader import Grade, Report
+    from recon.eval.variance import analyse
+
+    def rep(name, verdicts):
+        r = Report(solver=name, n=len(verdicts))
+        r.grades = [
+            Grade(task_id=f"T{i}", gold_codes=("D01",), pred_codes=("D01",),
+                  gold_actions=(), pred_actions=(), gold_status="closed",
+                  pred_status="closed", amount_cents=0, group_key=f"g{i}",
+                  is_composite=False, has_injection=False, attr_exact=v)
+            for i, v in enumerate(verdicts)]
+        r.metrics = {"attr_exact": sum(verdicts) / len(verdicts)}
+        return r
+
+    #        T0    T1     T2      T3
+    # run1  对    对     错      错
+    # run2  对    错     对      错
+    reps = [rep("a", [True, True, False, False]),
+            rep("b", [True, False, True, False])]
+    vr = analyse("cfg", reps)
+    assert vr.k == 2
+    assert vr.pass_1 == 0.5              # 平均正确率
+    assert vr.pass_k == 0.25             # 只有 T0 两次都对
+    assert vr.fail_k == 0.25             # 只有 T3 两次都错
+    assert vr.flip_rate == 0.5           # T1、T2 翻转
+    assert vr.unstable_tasks == ["T1", "T2"]
+    assert vr.pass_k < vr.pass_1, "pass^k 必须不高于 pass^1，否则定义搞反了"
+
+
+def test_noise_floor_is_reported(world):
+    from recon.eval.grader import Report
+    from recon.eval.variance import analyse
+
+    def rep(name, v):
+        r = Report(solver=name, n=1)
+        r.metrics = {"attr_exact": v, "attr_exact_text_dependent": v}
+        return r
+    vr = analyse("cfg", [rep("a", 0.50), rep("b", 0.60), rep("c", 0.55)])
+    assert vr.noise_floor_pp == pytest.approx(10.0)   # 极差 0.60-0.50

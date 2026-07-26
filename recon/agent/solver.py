@@ -15,17 +15,20 @@ from .. import db
 from ..eval.evidence import EvidenceView
 from ..eval.solution import Solution
 from ..eval.tasks import Task
+from .config import AgentConfig, V1
 from .llm import DeepSeekClient, LLMClient
 from .loop import AgentRunner, RunResult
 
 
 class AgentSolver:
-    def __init__(self, llm: LLMClient, *, max_steps: int = 14,
-                 max_cost_micro_cny: int | None = None):
+    def __init__(self, llm: LLMClient, *, max_steps: int | None = None,
+                 max_cost_micro_cny: int | None = None,
+                 cfg: AgentConfig | None = None):
         self.llm = llm
+        self.cfg = cfg or V1
         self.runner = AgentRunner(llm, max_steps=max_steps,
-                                  max_cost_micro_cny=max_cost_micro_cny)
-        self.name = f"agent:{getattr(llm, 'name', 'unknown')}"
+                                  max_cost_micro_cny=max_cost_micro_cny, cfg=self.cfg)
+        self.name = self.cfg.name if cfg else f"agent:{getattr(llm, 'name', 'unknown')}"
 
     def solve(self, task: Task, ev: EvidenceView) -> Solution:
         return self.runner.run(task, ev).solution
@@ -37,14 +40,15 @@ class AgentSolver:
 # --------------------------------------------------------------------------
 
 def run_agent(db_path: str | Path | None, tasks: Iterable[Task], *,
-              llm: LLMClient | None = None, max_steps: int = 14,
+              llm: LLMClient | None = None, max_steps: int | None = None,
               workers: int = 8, max_cost_micro_cny: int | None = None,
+              cfg: AgentConfig | None = None,
               progress: Callable[[int, int, RunResult], None] | None = None,
               ) -> tuple[dict[str, Solution], list[RunResult]]:
     tasks = list(tasks)
     client = llm or DeepSeekClient()
     solver = AgentSolver(client, max_steps=max_steps,
-                         max_cost_micro_cny=max_cost_micro_cny)
+                         max_cost_micro_cny=max_cost_micro_cny, cfg=cfg)
 
     results: list[RunResult] = []
 
@@ -87,6 +91,7 @@ def persist_runs(conn, results: list[RunResult], *, solver: str) -> int:
             "solver": solver, "model": r.model, "stop_reason": r.stop_reason,
             "steps": s.steps, "reads": s.reads, "chars_read": s.chars_read,
             "tokens_in": s.tokens_in, "tokens_out": s.tokens_out,
+            "cached_in": s.cached_in,
             "cost_micro_cny": s.cost_micro_cny, "latency_ms": s.latency_ms,
             "root_causes": db.jdump(s.root_causes), "actions": db.jdump(s.actions),
             "expected_status": s.expected_status, "confidence": s.confidence,

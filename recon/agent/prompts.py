@@ -14,7 +14,12 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..world.injector import ALL_ACTIONS, CODES
+from .config import AgentConfig, V1
+
+POLICY_DIR = Path(__file__).resolve().parent.parent / "policies"
 
 DECISION_SCHEMA = """{
   "thought": "本轮的推理，一两句话",
@@ -38,7 +43,67 @@ def code_vocabulary() -> str:
     return "\n".join(f"  {c.code}  {c.name}" for c in CODES.values())
 
 
-def system_prompt(tool_catalog: str, max_steps: int) -> str:
+SCOPE_BOUNDARY = """
+# ⚠️ 差错边界（最容易犯的错）
+
+你的归因只能解释**这一条差错**所指向的那个对象、那个维度。
+
+判断标准：如果某个原因不是造成 `get_diff` 返回的 `diff_cents` /
+`fee_delta_cents` / 单边缺失这个**具体现象**的直接原因，它就不属于这一条。
+
+同一个订单、同一个流水号上如果还有别的问题，它们会作为**独立的差错记录**
+被单独处置。不要把它们并进这一条的 root_causes，也不要因此追加处置动作。
+
+多报一个原因的代价不是「更全面」，而是：
+- 把不该动账的差错拖进 REVERSAL/SUPPLEMENT，那是错误动账；
+- 把本可关闭的差错拖成 escalated，那是过度转人工；
+- 在只能转人工的差错上追加动账动作，那是越权。
+"""
+
+DIMENSION_CHECKLIST = """
+# 收结论前必须过一遍这四个维度
+
+一个维度有问题就是一个原因。**只报一个原因就收尾，是复合差错最常见的漏报形式。**
+在 reasoning 里逐条说明每个维度的结论（哪怕是「无异常」）：
+
+1. **单边维度**：两侧是否都有该笔？缺失的那一侧是真的缺失，
+   还是只是落在了别的账单日（用跨账单日查询确认）？
+2. **金额维度**：gross 归一后是否相等？不等的差额能否被某条规则**精确**解释？
+3. **手续费维度**：我方 fee 与标准费率是否一致？渠道 fee 与标准费率是否一致？
+   —— 这两个是不同的原因，别混。
+4. **归属维度**：两侧时间戳是否一致？账单日归属是否正确？
+
+⚠️ 过一遍维度表 ≠ 把每个维度的观察都算成本条差错的原因。
+先按上面的差错边界判断它是否属于这一条。
+"""
+
+
+def _sop_text() -> str:
+    return (POLICY_DIR / "diff_sop.md").read_text(encoding="utf-8")
+
+
+def system_prompt(tool_catalog: str, max_steps: int,
+                  cfg: AgentConfig | None = None) -> str:
+    cfg = cfg or V1
+    extra = ""
+    if cfg.scope_boundary:
+        extra += SCOPE_BOUNDARY
+    if cfg.dimension_checklist:
+        extra += DIMENSION_CHECKLIST
+    if cfg.inline_sop:
+        extra += ("\n# 差错分类与标准处置流程（已内联，无需再 read_policy 取它）\n\n"
+                  + _sop_text()
+                  + "\n其它政策文档（计费/容差/退款/审批/结算）仍需按需 read_policy。\n")
+    return _base_prompt(tool_catalog, max_steps, cfg) + extra
+
+
+def _base_prompt(tool_catalog: str, max_steps: int, cfg: AgentConfig) -> str:
+    sop_hint = ("判定依据里最关键的 `diff_sop` 已内联在下方，不必再读它；"
+                "其它政策文档按需 read_policy。"
+                if cfg.inline_sop else
+                "判定依据**不在这里**。你必须自己调 read_policy 去读政策文档，"
+                "其中 `diff_sop` 是差错分类与标准处置流程，是最关键的一份。"
+                "不读政策就下结论，几乎一定会错。")
     return f"""你是支付清结算团队的对账差错处置员。给你一条对账差错，你要查清原因并给出处置方案。
 
 # 工作方式
@@ -61,9 +126,7 @@ def system_prompt(tool_catalog: str, max_steps: int) -> str:
 
 {code_vocabulary()}
 
-判定依据**不在这里**。你必须自己调 read_policy 去读政策文档，
-其中 `diff_sop` 是差错分类与标准处置流程，是最关键的一份。
-不读政策就下结论，几乎一定会错。
+{sop_hint}
 
 # 处置动作（只能从这些里选）
 

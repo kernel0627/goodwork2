@@ -271,6 +271,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     chars_read        INTEGER NOT NULL,
     tokens_in         INTEGER NOT NULL,
     tokens_out        INTEGER NOT NULL,
+    cached_in         INTEGER NOT NULL DEFAULT 0,
     cost_micro_cny    INTEGER NOT NULL,
     latency_ms        INTEGER NOT NULL,
     root_causes       TEXT NOT NULL,

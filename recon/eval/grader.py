@@ -77,6 +77,7 @@ class Grade:
     steps: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
+    cached_in: int = 0
     cost_micro_cny: int = 0
     latency_ms: int = 0
 
@@ -107,6 +108,7 @@ def grade_one(task: Task, sol: Solution) -> Grade:
         has_injection=task.has_injection,
         reads=sol.reads, rows_read=sol.rows_read, chars_read=sol.chars_read,
         steps=sol.steps, tokens_in=sol.tokens_in, tokens_out=sol.tokens_out,
+        cached_in=sol.cached_in,
         cost_micro_cny=sol.cost_micro_cny, latency_ms=sol.latency_ms,
     )
 
@@ -251,6 +253,12 @@ def aggregate(solver: str, tasks: list[Task], sols: dict[str, Solution]) -> Repo
         "avg_chars_read": sum(g.chars_read for g in grades) / n,
         "avg_steps": sum(g.steps for g in grades) / n,
         "avg_tokens_in": sum(g.tokens_in for g in grades) / n,
+        # ⭐ 缓存命中必须单列。内联 SOP 让原始 token 上涨，但 96% 是缓存命中，
+        #    只看「平均 token」会把结论读反 —— 缓存命中 token 的单价低一个数量级。
+        "avg_cached_in": sum(g.cached_in for g in grades) / n,
+        "avg_uncached_in": sum(g.tokens_in - g.cached_in for g in grades) / n,
+        "cache_hit_rate": (sum(g.cached_in for g in grades)
+                           / max(sum(g.tokens_in for g in grades), 1)),
         "avg_tokens_out": sum(g.tokens_out for g in grades) / n,
         "total_cost_micro_cny": sum(g.cost_micro_cny for g in grades),
         "avg_latency_ms": sum(g.latency_ms for g in grades) / n,

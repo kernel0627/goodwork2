@@ -502,6 +502,110 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
     conn.close()
 
 
+@cli.command("variance")
+@click.option("--db-path", default=None)
+@click.option("--limit", default=60, show_default=True)
+@click.option("--repeat", default=3, show_default=True, help="同配置跑几次")
+@click.option("--workers", default=14, show_default=True)
+@click.option("--model", default=None)
+@click.option("--rung", default=0, show_default=True,
+              help="用消融阶梯的第几级（0=v1 对照组）")
+@click.option("--save/--no-save", default=True)
+def variance_cmd(db_path: str | None, limit: int, repeat: int, workers: int,
+                 model: str | None, rung: int, save: bool) -> None:
+    """同配置重复跑，量方差与 pass^k。
+
+    ⚠️ 这一步必须在解读消融表**之前**做。
+       同配置两次运行在关键指标上相差过 7 个百分点，而消融各级差异也就 5~11 点 ——
+       不知道噪声下限就去追这种差异，是把噪声当结论。
+    """
+    from .agent.config import ablation_ladder
+    from .agent.llm import DeepSeekClient
+    from .agent.solver import run_agent
+    from .eval import variance as va
+    from .eval.grader import aggregate
+    from .eval.tasks import default_ensure, load_tasks, sample_tasks
+
+    conn = db.connect(db_path)
+    tasks = sample_tasks(load_tasks(conn), limit, ensure=default_ensure(limit))
+    client = DeepSeekClient(model=model)
+    cfg = ablation_ladder(client.name)[rung]
+    console.print(f"配置 [cyan]{cfg.label()}[/]，{len(tasks)} 条任务，"
+                  f"独立跑 [bold]{repeat}[/] 次")
+
+    reps = []
+    for i in range(1, repeat + 1):
+        sols, _ = run_agent(db_path, tasks, llm=client, cfg=cfg, workers=workers)
+        rep = aggregate(f"{cfg.label()}#{i}", tasks, sols)
+        reps.append(rep)
+        console.print(f"  第{i}次: 归因 {rep.metrics['attr_exact']:.1%} | "
+                      f"需读文本 {rep.metrics['attr_exact_text_dependent']:.1%} | "
+                      f"复合 {rep.metrics['attr_exact_composite']:.1%} | "
+                      f"UNKNOWN {rep.metrics['unknown_rate']:.1%}")
+
+    vr = va.analyse(cfg.label(), reps)
+    va.print_variance(vr)
+    if save:
+        p = DOCS / "stage3_variance.md"
+        p.write_text(va.variance_markdown(vr), encoding="utf-8")
+        console.print(f"[green]已写入[/] {p}")
+    conn.close()
+
+
+@cli.command("ablate")
+@click.option("--db-path", default=None)
+@click.option("--limit", default=60, show_default=True)
+@click.option("--workers", default=12, show_default=True)
+@click.option("--model", default=None)
+@click.option("--save/--no-save", default=True)
+def ablate_cmd(db_path: str | None, limit: int, workers: int,
+               model: str | None, save: bool) -> None:
+    """消融阶梯 —— 每一级只多开一个改动，同一批任务上跑，每行一个数字。
+
+    这张表回答的是「哪个改动值多少个点」，而不是笼统的「优化后提升了 N%」。
+    """
+    from .agent.config import ablation_ladder
+    from .agent.llm import DeepSeekClient
+    from .agent.solver import run_agent, stop_reason_stats
+    from .baseline.rules import run_baseline
+    from .eval import report as rp
+    from .eval.grader import aggregate
+    from .eval.tasks import default_ensure, load_tasks, sample_tasks
+    from .world.injector import TEXT_DEPENDENT_CODES
+
+    conn = db.connect(db_path)
+    every = load_tasks(conn)
+    tasks = sample_tasks(every, limit, ensure=default_ensure(limit))
+    n_text = sum(1 for t in tasks if set(t.gold_codes) & TEXT_DEPENDENT_CODES)
+    console.print(f"任务 [bold]{len(tasks)}[/] 条（需读自由文本 [magenta]{n_text}[/] 条），"
+                  f"所有配置跑同一批")
+
+    client = DeepSeekClient(model=model)
+    reps = [aggregate("rule_baseline", tasks, run_baseline(conn, tasks))]
+
+    for cfg in ablation_ladder(client.name):
+        console.print(f"\n[cyan]跑[/] {cfg.label()}")
+        sols, results = run_agent(db_path, tasks, llm=client, cfg=cfg,
+                                  workers=workers)
+        rep = aggregate(cfg.label(), tasks, sols)
+        reps.append(rep)
+        console.print(f"  归因 exact {rep.metrics['attr_exact']:.1%} | "
+                      f"需读文本 {rep.metrics['attr_exact_text_dependent']:.1%} | "
+                      f"复合 {rep.metrics['attr_exact_composite']:.1%} | "
+                      f"UNKNOWN {rep.metrics['unknown_rate']:.1%} | "
+                      f"过度转人工 {rep.metrics['over_escalation_n']} | "
+                      f"平均 token {rep.metrics['avg_tokens_in'] + rep.metrics['avg_tokens_out']:.0f} | "
+                      f"{stop_reason_stats(results)}")
+
+    console.rule("[bold]消融表[/]")
+    rp.print_comparison(reps)
+    if save:
+        p = DOCS / "stage3_ablation.md"
+        p.write_text(rp.comparison_markdown(reps, tasks=tasks), encoding="utf-8")
+        console.print(f"[green]已写入[/] {p}")
+    conn.close()
+
+
 @cli.command("replay")
 @click.argument("task_id", required=False)
 @click.option("--db-path", default=None)

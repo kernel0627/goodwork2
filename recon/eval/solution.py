@@ -25,6 +25,7 @@ class Solution:
     steps: int = 0            # 决策轮数（基线恒为 1）
     tokens_in: int = 0
     tokens_out: int = 0
+    cached_in: int = 0        # 输入里命中 prompt 缓存的部分
     cost_micro_cny: int = 0   # 微元（1e-6 元），避免浮点
     latency_ms: int = 0
 
@@ -44,6 +45,7 @@ class Solution:
             "chars_read": self.chars_read,
             "steps": self.steps,
             "tokens_in": self.tokens_in,
+            "cached_in": self.cached_in,
             "tokens_out": self.tokens_out,
             "cost_micro_cny": self.cost_micro_cny,
             "latency_ms": self.latency_ms,

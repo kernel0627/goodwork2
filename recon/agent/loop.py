@@ -20,6 +20,7 @@ from ..eval.solution import UNKNOWN, Solution
 from ..eval.tasks import Task
 from ..world.injector import ALL_ACTIONS, CODES
 from . import prompts
+from .config import AgentConfig, V1
 from .llm import LLMClient, LLMError, Usage
 from .tools import ToolBox, digest
 
@@ -51,11 +52,12 @@ class RunResult:
 
 
 class AgentRunner:
-    def __init__(self, llm: LLMClient, *, max_steps: int = 14,
+    def __init__(self, llm: LLMClient, *, max_steps: int | None = None,
                  max_cost_micro_cny: int | None = None,
-                 no_progress_limit: int = 2):
+                 no_progress_limit: int = 2, cfg: AgentConfig | None = None):
         self.llm = llm
-        self.max_steps = max_steps
+        self.cfg = cfg or V1
+        self.max_steps = max_steps if max_steps is not None else self.cfg.max_steps
         self.max_cost = max_cost_micro_cny
         self.no_progress_limit = no_progress_limit
 
@@ -67,7 +69,7 @@ class AgentRunner:
 
         messages: list[dict] = [
             {"role": "system",
-             "content": prompts.system_prompt(box.catalog(), self.max_steps)},
+             "content": prompts.system_prompt(box.catalog(), self.max_steps, self.cfg)},
             {"role": "user",
              "content": prompts.task_prompt(task.diff_id, task.channel_id, task.bill_date)},
         ]
@@ -202,6 +204,7 @@ class AgentRunner:
             evidence_refs=refs,
             reads=ev.reads, rows_read=ev.rows_read, chars_read=ev.chars_read,
             steps=steps, tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
+            cached_in=usage.cached_in,
             cost_micro_cny=usage.cost_micro_cny)
 
 

@@ -92,6 +92,8 @@ def print_report(rep: Report) -> None:
     t.add_row("  平均决策轮数", f"{m['avg_steps']:.2f}")
     t.add_row("  平均 token (in/out)",
               f"{m['avg_tokens_in']:.0f} / {m['avg_tokens_out']:.0f}")
+    t.add_row("  其中未缓存输入 / 缓存命中率",
+              f"{m['avg_uncached_in']:.0f} / {_pct(m['cache_hit_rate'])}")
     t.add_row("  总成本", f"{m['total_cost_micro_cny'] / 1_000_000:.4f} 元")
     t.add_row("  平均延迟", f"{m['avg_latency_ms']:.0f} ms")
     console.print(t)
@@ -236,7 +238,9 @@ COMPARISON_ROWS = [
     ("注入抵抗率", lambda m: _pct_or_dash(m["injection_resist_rate"], m["injection_n"])),
     ("平均取证次数", lambda m: f"{m['avg_reads']:.1f}"),
     ("平均决策轮数", lambda m: f"{m['avg_steps']:.1f}"),
-    ("平均 token", lambda m: f"{m['avg_tokens_in'] + m['avg_tokens_out']:.0f}"),
+    ("平均 token 合计", lambda m: f"{m['avg_tokens_in'] + m['avg_tokens_out']:.0f}"),
+    ("⭐未缓存输入 token", lambda m: f"{m['avg_uncached_in']:.0f}"),
+    ("缓存命中率", lambda m: _pct(m["cache_hit_rate"])),
     ("总成本 元", lambda m: f"{m['total_cost_micro_cny'] / 1e6:.4f}"),
     ("平均延迟 ms", lambda m: f"{m['avg_latency_ms']:.0f}"),
 ]
