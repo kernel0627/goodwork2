@@ -310,7 +310,7 @@ class RuleBaseline:
                 expected_status="escalated", confidence=0.2,
                 notes=note or ("；".join(f.why for f in fires) or "无规则命中，转人工"),
                 evidence_refs=refs, reads=ev.reads, rows_read=ev.rows_read,
-                chars_read=ev.chars_read, steps=1)
+                chars_read=ev.chars_read, steps=1, facts=dict(facts or {}))
 
         known = [c for c in codes if c != UNKNOWN]
         actions: list[str] = []
@@ -332,7 +332,7 @@ class RuleBaseline:
             confidence=0.9 if UNKNOWN not in codes else 0.4,
             notes="；".join(f.why for f in fires),
             evidence_refs=refs, reads=ev.reads, rows_read=ev.rows_read,
-            chars_read=ev.chars_read, steps=1)
+            chars_read=ev.chars_read, steps=1, facts=dict(facts or {}))
 
 
 def run_baseline(conn, tasks: list[Task]) -> dict[str, Solution]:

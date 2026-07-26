@@ -88,6 +88,30 @@ SYSTEM = """你是支付清结算团队的对账复核员。规则引擎已经�
 """ + DECISION_SCHEMA
 
 
+def _fee_block(facts: dict) -> str:
+    """手续费三方对照。
+
+    刻意只摆事实、不加措辞 —— 上一版试过在提示词里加「必须核对前提条件」那类
+    强约束，结果把模型整体推保守：误改判少了，但漏判了 7 条真 D22，
+    错误动账从 0 涨到 7 条。见 docs/stage4_router_design.md。
+    """
+    f = facts.get("fee")
+    if not f:
+        return ""
+    def mark(ok):
+        return "一致" if ok else ("不一致" if ok is False else "无数据")
+    ch_fee = f.get("channel_fee_cents")
+    return f"""
+# 手续费三方对照（规则复算，供你核对）
+
+| | 金额 | 与合同费率 |
+|---|---:|---|
+| 我方记账手续费 | {f['our_fee_cents']} 分 | {mark(f.get('our_matches_standard'))} |
+| 按合同费率复算 | {f['standard_fee_cents']} 分 | — |
+| 渠道账单手续费 | {ch_fee if ch_fee is not None else '（无）'} 分 | {mark(f.get('channel_matches_standard'))} |
+"""
+
+
 def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict]) -> str:
     codes = "、".join(rule_sol.root_causes) or "（无）"
     acts = "、".join(rule_sol.actions) or "（无）"
@@ -102,7 +126,7 @@ def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict]) -> str:
 
 规则引擎的结论：**{codes}**，拟执行动作 {acts}
 规则的依据：{rule_sol.notes or "（未记录）"}
-
+{_fee_block(rule_sol.facts)}
 # 该渠道该账单日的全部公告（共 {len(notices)} 条）
 
 {body or "（无）"}

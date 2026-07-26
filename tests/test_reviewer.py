@@ -173,3 +173,62 @@ def test_review_stats_shape():
     assert s == {"reviewed": 2, "overridden": 1, "kept": 1, "errors": 1,
                  "avg_tokens_in": 100.0, "avg_tokens_out": 0.0,
                  "cached_rate": 0.3}
+
+
+# ------------------------------------------------------ 结构化手续费事实
+
+def test_rule_records_which_side_deviates(world):
+    """D05 与 D22 的分辨点就是「偏离合同费率的是哪一侧」。规则算得出来，
+    但只写在中文 notes 里，下游读起来不可靠 —— 所以要有结构化字段。"""
+    ev = EvidenceView(world)
+    rules = RuleBaseline()
+    ours = chan = 0
+    for t in load_tasks(world):
+        sol = rules.solve(t, ev)
+        fee = sol.facts.get("fee")
+        if not fee or "deviating_side" not in fee:
+            continue
+        side = fee["deviating_side"]
+        # 结构化字段必须和 notes 的中文说法一致，否则两边会打架
+        assert ("我方手续费" in sol.notes) == (side == "ours")
+        ours += side == "ours"
+        chan += side == "channel"
+    assert ours and chan, "两种偏离方向都应该出现在样本里"
+
+
+def test_fee_facts_are_internally_consistent(world):
+    ev = EvidenceView(world)
+    for t in load_tasks(world):
+        fee = RuleBaseline().solve(t, ev).facts.get("fee")
+        if not fee:
+            continue
+        assert fee["our_matches_standard"] == (
+            abs(fee["our_fee_cents"] - fee["standard_fee_cents"]) < 2)
+        if fee["channel_fee_cents"] is not None:
+            assert fee["channel_matches_standard"] == (
+                abs(fee["channel_fee_cents"] - fee["standard_fee_cents"]) < 2)
+
+
+def test_prompt_shows_the_fee_comparison(world):
+    """事实要真的出现在提示词里，否则加了等于没加。"""
+    ev = EvidenceView(world)
+    rules = RuleBaseline()
+    target = next((t for t in load_tasks(world)
+                   if "fee" in rules.solve(t, ev).facts
+                   and route_reason(rules.solve(t, ev), t, ev)[0]), None)
+    if target is None:
+        pytest.skip("样本里没有带手续费事实且被路由的任务")
+
+    prior = rules.solve(target, ev)
+    llm = FakeLLM([_not_covered()])
+    NoticeReviewer(llm).solve(target, EvidenceView(world), prior=prior)
+    prompt = llm.seen[0][1]["content"]
+    assert "手续费三方对照" in prompt
+    assert str(prior.facts["fee"]["standard_fee_cents"]) in prompt
+
+
+def test_prompt_has_no_fee_block_when_there_is_no_fee_dimension(world):
+    """不涉及手续费的差错不该被塞一张空表。"""
+    prior = Solution(task_id="T1", root_causes=["D01"], actions=["CHANNEL_INQUIRY"])
+    from recon.agent.reviewer import _fee_block
+    assert _fee_block(prior.facts) == ""

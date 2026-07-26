@@ -512,9 +512,13 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
 @click.option("--mode", type=click.Choice(["review", "resolve"]), default="review",
               show_default=True,
               help="review=单次调用复核规则结论；resolve=让完整 agent 从零重解")
+@click.option("--gate", type=click.Choice(["any", "typed"]), default="any",
+              show_default=True,
+              help="any=当日有任何公告就路由（零模型）；typed=先给公告分类，只在类型对得上时路由")
 @click.option("--save/--no-save", default=True)
 def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
-              model: str | None, dry_run: bool, mode: str, save: bool) -> None:
+              model: str | None, dry_run: bool, mode: str, gate: str,
+              save: bool) -> None:
     """规则优先路由 —— 规则先跑，只把它注定读不到的那部分交给模型。
 
     --dry-run 只跑闸门：路由比例、需读文本召回、放行部分正确率，全部零 token。
@@ -543,22 +547,39 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
     n_text = sum(1 for t in tasks if set(t.gold_codes) & TEXT_DEPENDENT_CODES)
     console.print(f"任务 [bold]{len(tasks)}[/] 条（需读自由文本 [magenta]{n_text}[/] 条）")
 
+    # ---- 公告分类（可选，调用次数 = 公告数，与任务数无关）----
+    covering = None
+    if gate == "typed":
+        from .agent.notice_classifier import (classify_all, covering_dates,
+                                              label_stats)
+        client0 = DeepSeekClient(model=model)
+        labels = classify_all(conn, client0)
+        ls = label_stats(labels)
+        console.print(f"公告分类：{ls['notices']} 条，本次实际调用 "
+                      f"[cyan]{ls['calls']}[/] 次（其余命中缓存），{ls['by_label']}")
+        if not ls["trustworthy"]:
+            console.print(
+                f"[bold red]警告[/] {ls['fallbacks']}/{ls['notices']} 条分类失败，"
+                f"已按 fail-safe 当作覆盖性公告。**本次 typed 闸门的数字不可用于下结论** ——"
+                f"它等价于一个更宽的闸门，不是分类的效果。")
+        covering = covering_dates(conn, labels)
+
     # ---- 闸门（零 token）----
     ev = EvidenceView(conn)
-    gate = RouterSolver(rules=RuleBaseline())
+    router = RouterSolver(rules=RuleBaseline(), covering=covering)
     rule_sols = {}
     for t in tasks:
-        sol, _ = gate.decide(t, ev)
+        sol, _ = router.decide(t, ev)
         rule_sols[t.task_id] = sol
-    s = route_summary(gate.decisions)
-    routed_ids = {d.task_id for d in gate.decisions if d.routed}
+    s = route_summary(router.decisions)
+    routed_ids = {d.task_id for d in router.decisions if d.routed}
 
     kept = [t for t in tasks if t.task_id not in routed_ids]
     kept_ok = sum(grade_one(t, rule_sols[t.task_id]).attr_exact for t in kept)
     recall = sum(1 for t in tasks if t.task_id in routed_ids
                  and set(t.gold_codes) & TEXT_DEPENDENT_CODES)
 
-    tb = Table(title="闸门（零 token）", show_header=False)
+    tb = Table(title=f"闸门 gate={gate}", show_header=False)
     tb.add_row("路由给 agent", f"{s['routed']}/{s['total']} = {s['routed_rate']:.1%}")
     tb.add_row("需读文本召回", f"{recall}/{n_text}" + ("  ✅" if recall == n_text else "  ❌ 会错误动账"))
     tb.add_row("放行部分正确率", f"{kept_ok}/{len(kept)} = "
@@ -592,7 +613,8 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
             return sols_
         merge = True
 
-    sols, _ = run_router(db_path, tasks, inner_run=inner_run, merge=merge)
+    sols, _ = run_router(db_path, tasks, inner_run=inner_run, merge=merge,
+                         covering=covering)
 
     if stats:
         console.print(f"复核 {stats['reviewed']} 条：改判 [cyan]{stats['overridden']}[/]、"
@@ -601,11 +623,11 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
                       f"（缓存命中 {stats['cached_rate']:.0%}）")
 
     reps = [aggregate("rule_baseline", tasks, run_baseline(conn, tasks)),
-            aggregate(f"router-{mode}({client.name})", tasks, sols)]
+            aggregate(f"router-{mode}-{gate}({client.name})", tasks, sols)]
     console.rule("[bold]规则基线 vs 规则优先路由[/]")
     rp.print_comparison(reps)
     if save:
-        p = DOCS / f"stage4_router_{mode}.md"
+        p = DOCS / f"stage4_router_{mode}_{gate}.md"
         p.write_text(rp.comparison_markdown(reps, tasks=tasks), encoding="utf-8")
         console.print(f"[green]已写入[/] {p}")
     conn.close()
@@ -618,10 +640,16 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
 @click.option("--workers", default=14, show_default=True)
 @click.option("--model", default=None)
 @click.option("--rung", default=0, show_default=True,
-              help="用消融阶梯的第几级（0=v1 对照组）")
+              help="用消融阶梯的第几级（0=v1 对照组，3=全开）")
+@click.option("--split", default="all",
+              type=click.Choice(["all", "text", "rule"]),
+              help="只跑某一档；text 档必须独立跑全量才有分辨率")
+@click.option("--vote", default=0, show_default=True,
+              help="每 N 次运行投一票（0=不投票），额外给出投票解法的 pass^k")
 @click.option("--save/--no-save", default=True)
 def variance_cmd(db_path: str | None, limit: int, repeat: int, workers: int,
-                 model: str | None, rung: int, save: bool) -> None:
+                 model: str | None, rung: int, split: str, vote: int,
+                 save: bool) -> None:
     """同配置重复跑，量方差与 pass^k。
 
     ⚠️ 这一步必须在解读消融表**之前**做。
@@ -635,28 +663,55 @@ def variance_cmd(db_path: str | None, limit: int, repeat: int, workers: int,
     from .eval.grader import aggregate
     from .eval.tasks import default_ensure, load_tasks, sample_tasks
 
+    from .agent.vote import vote_batches
+
     conn = db.connect(db_path)
-    tasks = sample_tasks(load_tasks(conn), limit, ensure=default_ensure(limit))
+    pool = load_tasks(conn, split=split)
+    tasks = pool if split == "text" else sample_tasks(pool, limit,
+                                                      ensure=default_ensure(limit))
     client = DeepSeekClient(model=model)
     cfg = ablation_ladder(client.name)[rung]
-    console.print(f"配置 [cyan]{cfg.label()}[/]，{len(tasks)} 条任务，"
-                  f"独立跑 [bold]{repeat}[/] 次")
+    console.print(f"配置 [cyan]{cfg.label()}[/]  档位 [magenta]{split}[/]  "
+                  f"{len(tasks)} 条任务，独立跑 [bold]{repeat}[/] 次"
+                  + (f"，每 {vote} 次投一票" if vote else ""))
+    console.print(f"  分辨率：一条任务 = {100 / max(len(tasks), 1):.1f}pp")
 
-    reps = []
+    runs, reps = [], []
     for i in range(1, repeat + 1):
         sols, _ = run_agent(db_path, tasks, llm=client, cfg=cfg, workers=workers)
+        runs.append(sols)
         rep = aggregate(f"{cfg.label()}#{i}", tasks, sols)
         reps.append(rep)
         console.print(f"  第{i}次: 归因 {rep.metrics['attr_exact']:.1%} | "
-                      f"需读文本 {rep.metrics['attr_exact_text_dependent']:.1%} | "
-                      f"复合 {rep.metrics['attr_exact_composite']:.1%} | "
+                      f"动作 {rep.metrics['action_exact']:.1%} | "
                       f"UNKNOWN {rep.metrics['unknown_rate']:.1%}")
 
     vr = va.analyse(cfg.label(), reps)
     va.print_variance(vr)
+
+    vr_vote = None
+    if vote and repeat >= vote * 2:
+        voted = vote_batches(runs, group=vote)
+        vreps = [aggregate(f"{cfg.label()}vote{vote}#{i}", tasks, v)
+                 for i, v in enumerate(voted, 1)]
+        console.rule(f"[bold]自一致性投票：每 {vote} 次投一票，得到 {len(voted)} 个独立答案[/]")
+        for i, r in enumerate(vreps, 1):
+            console.print(f"  第{i}票: 归因 {r.metrics['attr_exact']:.1%} | "
+                          f"动作 {r.metrics['action_exact']:.1%} | "
+                          f"UNKNOWN {r.metrics['unknown_rate']:.1%}")
+        vr_vote = va.analyse(f"{cfg.label()}vote{vote}", vreps)
+        va.print_variance(vr_vote)
+        console.print(f"[bold]单解法 pass^{vr.k}={vr.pass_k:.1%}  ->  "
+                      f"投票解法 pass^{vr_vote.k}={vr_vote.pass_k:.1%}[/]"
+                      f"（代价：每个答案 {vote} 倍 token）")
+
     if save:
-        p = DOCS / "stage3_variance.md"
-        p.write_text(va.variance_markdown(vr), encoding="utf-8")
+        suffix = f"_{split}" if split != "all" else ""
+        p = DOCS / f"stage4_variance{suffix}.md"
+        body = va.variance_markdown(vr)
+        if vr_vote:
+            body += "\n\n---\n\n" + va.variance_markdown(vr_vote)
+        p.write_text(body, encoding="utf-8")
         console.print(f"[green]已写入[/] {p}")
     conn.close()
 

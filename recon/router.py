@@ -84,8 +84,22 @@ class RouteDecision:
     n_notices: int
 
 
-def route_reason(sol: Solution, task: Task, ev: EvidenceView) -> tuple[bool, str, int]:
-    """要不要把这条交给 agent。纯结构化判断，零 token。
+# 结论编码 -> 能改判它的公告类型（notice_classifier 的标签）
+COVER_KIND = {"D01": "delay", "D05": "fee"}
+
+
+def route_reason(sol: Solution, task: Task, ev: EvidenceView,
+                 covering: dict[str, set[tuple[str, str]]] | None = None,
+                 ) -> tuple[bool, str, int]:
+    """要不要把这条交给复核。纯结构化判断，零 token。
+
+    covering=None（默认）：只要当日该渠道有**任何**公告就路由。零模型依赖，
+    需读文本召回按构造是 100%。
+
+    covering={标签: {(渠道,账单日)…}}：只在存在**类型对得上的覆盖性公告**时
+    才路由。路由比例明显下降，但召回从此依赖分类器的质量 ——
+    分类器漏标一条覆盖性公告，这里就会漏放，代价是错误动账。
+    所以分类器那一层必须 fail-safe（见 notice_classifier 模块说明）。
 
     返回 (是否路由, 理由, 当日公告条数)。
     """
@@ -103,6 +117,16 @@ def route_reason(sol: Solution, task: Task, ev: EvidenceView) -> tuple[bool, str
     if not notices:
         return False, f"结论含 {'/'.join(hits)}，但该渠道该账单日无公告", 0
 
+    if covering is not None:
+        where = (task.channel_id, task.bill_date)
+        matched = [c for c in hits
+                   if where in covering.get(COVER_KIND.get(c, ""), set())]
+        if not matched:
+            return (False,
+                    f"结论含 {'/'.join(hits)}，当日 {len(notices)} 条公告经分类"
+                    f"均非对应类型的覆盖性公告", len(notices))
+        hits = matched
+
     alt = "/".join(TEXT_OVERRIDABLE[c] for c in hits)
     return True, f"结论含 {'/'.join(hits)}，当日 {len(notices)} 条公告可能改判为 {alt}", len(notices)
 
@@ -111,11 +135,15 @@ class RouterSolver:
     """规则 + 任意 inner 求解方的混合。inner 只在闸门触发时被调用。"""
 
     def __init__(self, inner: Solver | None = None, *,
-                 rules: RuleBaseline | None = None, name: str | None = None):
+                 rules: RuleBaseline | None = None, name: str | None = None,
+                 covering: dict[str, set[tuple[str, str]]] | None = None):
         """inner 可以为 None —— 那样只有闸门可用（decide）。
-        闸门是零 token 的，先单独跑它看要花多少钱是常规用法。"""
+        闸门是零 token 的，先单独跑它看要花多少钱是常规用法。
+
+        covering 传入公告分类结果时闸门收窄成「类型对得上」，见 route_reason。"""
         self.rules = rules or RuleBaseline()
         self.inner = inner
+        self.covering = covering
         self.name = name or f"router({getattr(inner, 'name', 'gate-only')})"
         self.decisions: list[RouteDecision] = []
 
@@ -137,7 +165,7 @@ class RouterSolver:
         """跑规则并做闸门判断，但不调用 inner。批量跑时先做这一步，
         才能只对被路由的任务开线程池。"""
         sol = self.rules.solve(task, ev)
-        routed, reason, n = route_reason(sol, task, ev)
+        routed, reason, n = route_reason(sol, task, ev, self.covering)
         d = RouteDecision(task.task_id, routed, reason,
                           tuple(sol.root_causes), n)
         self.decisions.append(d)
@@ -166,6 +194,7 @@ def run_router(db_path: str | Path | None, tasks: Iterable[Task], *,
                                    dict[str, Solution]],
                rules: RuleBaseline | None = None,
                merge: bool = True,
+               covering: dict[str, set[tuple[str, str]]] | None = None,
                ) -> tuple[dict[str, Solution], list[RouteDecision]]:
     """批量跑。闸门是零成本的，所以先单线程全跑一遍规则，再把被路由的那批
     交给 inner_run 并发处理 —— 而不是每条任务都进线程池。
@@ -180,7 +209,7 @@ def run_router(db_path: str | Path | None, tasks: Iterable[Task], *,
     conn = db.connect(db_path)
     try:
         ev = EvidenceView(conn)
-        router = RouterSolver(rules=rules)          # 只用闸门，inner 走批量那条路
+        router = RouterSolver(rules=rules, covering=covering)   # 只用闸门
         rule_sols: dict[str, Solution] = {}
         routed: list[Task] = []
         for t in tasks:
@@ -214,5 +243,5 @@ def route_summary(decisions: list[RouteDecision]) -> dict:
     }
 
 
-__all__ = ["TEXT_OVERRIDABLE", "RouteDecision", "RouterSolver", "route_reason",
-           "run_router", "route_summary"]
+__all__ = ["TEXT_OVERRIDABLE", "COVER_KIND", "RouteDecision", "RouterSolver",
+           "route_reason", "run_router", "route_summary", "wants_prior"]
