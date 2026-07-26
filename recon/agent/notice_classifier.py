@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 from pathlib import Path
 
@@ -36,7 +37,20 @@ from .llm import LLMClient, LLMError
 DELAY = "delay"          # 明细未下发、次日补发   -> 可把 D01 改判为 D21
 FEE = "fee"              # 渠道误用费率、将自行更正 -> 可把 D05 改判为 D22
 NONE = "none"            # 不改变任何处置
-COVERING = (DELAY, FEE)
+
+# ⭐ 兜底标签：分类失败或返回未知标签时用它。
+#    ⚠️ 原实现兜底回落到 DELAY，注释写着「一律当覆盖性」—— **那是错的**：
+#       delay 只对 D01 是覆盖性，对 D05 不是。而 typed 闸门按类型分集合查
+#       （D01 查 delay、D05 查 fee），所以一条**费率**公告分类失败回落成 delay 后：
+#           D05 去查 fee 集合 -> 查不到 -> 不进复核 -> 规则直接 REVERSAL
+#       结果是「分类失败会造成错误动账」。单模块看起来 fail-safe，组合起来不安全。
+#    正确做法：兜底标签同时进 delay 和 fee 两个集合，宁可多路由（只是白花钱）。
+UNKNOWN_COVERING = "unknown_covering"
+
+COVERING = (DELAY, FEE, UNKNOWN_COVERING)
+
+# 分类标准的版本号。改了标签定义或提示词就要 +1，否则旧缓存会被误用。
+SCHEMA_VERSION = "v2-unknown-covering"
 
 CACHE_PATH = db.PROJECT_ROOT / "data" / "notice_labels.json"
 
@@ -71,7 +85,14 @@ SYSTEM = f"""你是支付清结算团队的对账人员。给你一条渠道公�
 
 
 def _key(row) -> str:
-    h = hashlib.sha256(row["body"].encode("utf-8")).hexdigest()[:16]
+    # ⚠️ key 必须带版本：只用 body hash 的话，改了分类标准或换了模型之后
+    #    旧缓存照旧命中，你会拿着旧标准的标签当成新标准的结果。
+    payload = "|".join([
+        row["body"], SCHEMA_VERSION,
+        hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest()[:12],
+        os.environ.get("RECON_AGENT_MODEL", "deepseek-v4-flash"),
+    ])
+    h = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     return f"{row['id']}:{h}"
 
 
@@ -102,11 +123,13 @@ def classify_one(llm: LLMClient, row) -> tuple[str, str, bool]:
     try:
         data, _ = llm.complete_json(msgs, max_tokens=800)
     except LLMError as e:
-        return DELAY, f"分类调用失败，按 fail-safe 当作覆盖性：{e}", False
+        return (UNKNOWN_COVERING,
+                f"分类调用失败，按 fail-safe 同时当作 delay 与 fee 覆盖：{e}", False)
 
     label = str(data.get("label") or "").strip().lower()
     if label not in (DELAY, FEE, NONE):
-        return DELAY, f"返回了未知标签 {label!r}，按 fail-safe 当作覆盖性", False
+        return (UNKNOWN_COVERING,
+                f"返回了未知标签 {label!r}，按 fail-safe 同时当作两类覆盖", False)
     return label, str(data.get("reasoning") or "")[:300], True
 
 
@@ -153,10 +176,14 @@ def covering_dates(conn, labels: dict[str, dict]) -> dict[str, set[tuple[str, st
         lab = (labels.get(row["id"]) or {}).get("label")
         if lab not in COVERING:
             continue
+        # 兜底标签进两个集合 —— 不知道它是哪一类，就两类都当覆盖，
+        # 代价是多路由几条（白花钱），而漏路由的代价是错误动账。
+        targets = (DELAY, FEE) if lab == UNKNOWN_COVERING else (lab,)
         d0 = date.fromisoformat(row["effective_from"])
         d1 = date.fromisoformat(row["effective_to"] or row["effective_from"])
         while d0 <= d1:
-            out[lab].add((row["channel_id"], d0.isoformat()))
+            for t in targets:
+                out[t].add((row["channel_id"], d0.isoformat()))
             d0 += timedelta(days=1)
     return out
 

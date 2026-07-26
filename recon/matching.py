@@ -19,8 +19,22 @@ from .money import to_gross
 from .world.generator import bill_date_for
 
 
-def recon_ts(bill_date: str, hour: int = 7) -> str:
+def recon_ts(bill_date: str, hour: int = 11) -> str:
     """对账动作的时间戳 —— 从账单日派生，绝不用 datetime.now()。
+
+    ⚠️ 这个小时数不是随便定的，它决定了求解方能看到哪些公告（Task.as_of）。
+       原来写的是 07:00，而渠道公告在账单日次日 09:30 才发布、更正公告 10:30 ——
+       于是求解方在 07:00 就读到了两三个小时后才存在的信息，**未来信息泄漏**。
+       但反过来把 as_of 卡在 07:00 也不对：那样所有公告都看不见，
+       D21/D22 全变成不可解，整个项目的价值消失。
+
+       真正错的是这个 07:00：**真实对账是在渠道当日公告发布之后才跑的**。
+       改成 11:00，晚于原公告(09:30)和更正公告(10:30)，两个问题一起解决。
+       由 tests/test_ground_truth_quality.py::test_no_future_notice_leak 和
+       ::test_covering_notices_are_visible_at_decision_time 两条守住。
+
+       「公告在对账之后才到达、需要重新评估」是另一个真实场景，
+       属阶段 6 的挂起—次日恢复，不在这里混做。
 
     ⚠️ 这里曾经用 now()，导致同 seed 两次构建只要跨了秒边界，
        recon_diffs.created_at 就不同，整个任务集变成不可复现。
@@ -340,7 +354,7 @@ def scan_business_rules(conn, dates: list[str]) -> dict[str, int]:
             "our_ref_signed": 0, "channel_signed": 0,
             "our_gross_cents": r["amount_cents"], "channel_gross_cents": None,
             "diff_cents": excess, "fee_delta_cents": 0,
-            "status": "new", "created_at": recon_ts(r["last_refund_date"], 8),
+            "status": "new", "created_at": recon_ts(r["last_refund_date"], 12),
         })
         inj = inj_by_order.get(r["order_id"])
         explanation = inj["explanation"] if inj else (
@@ -410,7 +424,7 @@ def inject_post_match(conn, dates: list[str], *, limit: int = 6) -> dict[str, in
             "diff_cents": row["amount_cents"],
             "fee_delta_cents": 0,
             "status": "new",
-            "created_at": recon_ts(row["period_start"], 9),
+            "created_at": recon_ts(row["period_start"], 13),
         })
         explanation = (f"商户 {row['merchant_id']} 的 allow_advance=0（不允许垫资），"
                        f"但 {row['period_start']} 存在未平差错的情况下，结算单 {row['settle_id']}"

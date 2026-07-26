@@ -90,8 +90,11 @@ def _budget(rows: list, n: int = MAX_ROWS, hint: str = "") -> dict:
 # --------------------------------------------------------------------------
 
 class ToolBox:
-    def __init__(self, ev: EvidenceView, *, strip_injection_policy: bool = False):
+    def __init__(self, ev: EvidenceView, *, strip_injection_policy: bool = False,
+                 as_of: str | None = None):
         self.ev = ev
+        # 决策时刻。公告查询按它过滤 published_at，避免读到未来才发布的公告。
+        self.as_of = as_of
         # 剥离对照组必须在**所有**读到 SOP 的路径上生效，否则模型一个
         # read_policy 就把剥掉的章节读回来了，对照组照旧不成立。
         self.strip_injection_policy = strip_injection_policy
@@ -264,7 +267,8 @@ class ToolBox:
         if s is None:
             raise NotFound(f"结算单 {settlement_id} 不存在")
         m = self.ev.merchant(s["merchant_id"])
-        others = self.ev.open_diffs(s["period_start"], exclude=None)
+        others = self.ev.open_diffs(s["period_start"], exclude=None,
+                                    until=s["period_end"])
         return {"settlement_id": s["id"], "merchant_id": s["merchant_id"],
                 "period_start": s["period_start"], "period_end": s["period_end"],
                 "amount_cents": s["amount_cents"], "status": s["status"],
@@ -285,7 +289,7 @@ class ToolBox:
                        hint="命中太多，请缩小时间窗")
 
     def read_channel_notices(self, channel_id: str, bill_date: str) -> dict:
-        rows = self.ev.channel_notices(channel_id, bill_date)
+        rows = self.ev.channel_notices(channel_id, bill_date, as_of=self.as_of)
         return {"rows": [{"notice_id": r["id"], "title": r["title"],
                           "published_at": r["published_at"],
                           "effective_from": r["effective_from"],

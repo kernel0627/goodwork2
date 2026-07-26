@@ -39,7 +39,7 @@ from ..eval.evidence import EvidenceView
 from ..eval.solution import Solution
 from ..eval.tasks import Task
 from ..world.injector import CODES, HOLD_NEXT_BILL
-from .llm import LLMClient, LLMError
+from .llm import LLMClient, LLMError, LLMFatalError
 
 # 复核只允许做这一种改判 —— 与 router.TEXT_OVERRIDABLE 同源，见 diff_sop.md
 OVERRIDE = {"D01": "D21", "D05": "D22"}
@@ -234,7 +234,8 @@ class NoticeReviewer:
     # ------------------------------------------------------------------
     def solve(self, task: Task, ev: EvidenceView, *, prior: Solution) -> Solution:
         before = (ev.reads, ev.rows_read, ev.chars_read)
-        notices = ev.channel_notices(task.channel_id, task.bill_date)
+        notices = ev.channel_notices(task.channel_id, task.bill_date,
+                                     as_of=task.as_of or None)
         txn_time = _txn_time(ev, task)
         read_cost = (ev.reads - before[0], ev.rows_read - before[1],
                      ev.chars_read - before[2])
@@ -245,16 +246,26 @@ class NoticeReviewer:
         t0 = time.time()
         try:
             data, usage = self.llm.complete_json(messages, max_tokens=1500)
+        except LLMFatalError:
+            # 余额/密钥/权限问题不是「这条复核失败」，是整批都跑不了。
+            # 吞掉它会让 336 条全部静默退化成规则结论 —— 其中含 D05 的那些
+            # 会直接动账，而报表上看不出任何异常。必须让它炸出来。
+            raise
         except LLMError as e:
-            # 复核失败就维持规则结论。这是安全方向：规则至少是确定性的，
-            # 而且失败时改判等于凭空动账。
             self.results.append(ReviewResult(
                 task.task_id, False, None, f"复核调用失败：{e}",
                 latency_ms=int((time.time() - t0) * 1000), error=str(e)))
-            return prior
+            return safe_review_failure(prior, str(e))
 
-        covered = bool(data.get("covered"))
-        target = data.get("override") if covered else None
+        ok, why, covered, target = _validate(data, notices, prior)
+        if not ok:
+            # 解析不过就走安全兜底，不做默默类型转换。
+            # ⚠️ 原实现是 bool(data.get("covered"))：模型返回 {"covered":"false"}
+            #    时，非空字符串在 Python 里是 True —— 会把「没覆盖」读成「覆盖」。
+            self.results.append(ReviewResult(
+                task.task_id, False, None, f"复核输出不合法：{why}",
+                latency_ms=int((time.time() - t0) * 1000), error=why))
+            return safe_review_failure(prior, why)
         reasoning = str(data.get("reasoning") or "")[:500]
 
         out = prior
@@ -282,6 +293,37 @@ class NoticeReviewer:
         if applied:
             out.notes = f"{out.notes}；复核改判：{reasoning}"
         return out
+
+
+def _validate(data: dict, notices: list[dict],
+              prior: Solution) -> tuple[bool, str, bool, str | None]:
+    """严格校验复核输出。返回 (是否合法, 原因, covered, override)。
+
+    不做任何隐式类型转换 —— 一次 `bool("false") == True` 就能把「没覆盖」
+    读成「覆盖」，从而凭空改判。
+    """
+    cov = data.get("covered")
+    if not isinstance(cov, bool):
+        return False, f"covered 必须是布尔值，收到 {cov!r}", False, None
+
+    target = data.get("override")
+    nid = data.get("notice_id")
+
+    if not cov:
+        if target or nid:
+            return (False, f"covered=false 时不该给 override/notice_id"
+                           f"（收到 {target!r}/{nid!r}）", False, None)
+        return True, "", False, None
+
+    if target not in OVERRIDE.values():
+        return False, f"override 必须是 {sorted(OVERRIDE.values())}，收到 {target!r}", False, None
+    src = next((s for s, t in OVERRIDE.items() if t == target), None)
+    if src not in prior.root_causes:
+        return (False, f"override 目标 {target} 对应的源编码 {src} 不在规则结论 "
+                       f"{prior.root_causes} 里，无从改判", False, None)
+    if nid is not None and nid not in {n["id"] for n in notices}:
+        return False, f"notice_id {nid!r} 不属于本次提供的公告", False, None
+    return True, "", True, target
 
 
 def _apply_override(prior: Solution, target: str) -> Solution:
@@ -312,6 +354,46 @@ def _apply_override(prior: Solution, target: str) -> Solution:
         task_id=prior.task_id, root_causes=codes, actions=actions,
         expected_status=status, confidence=prior.confidence,
         notes=prior.notes, evidence_refs=list(prior.evidence_refs),
+        reads=prior.reads, rows_read=prior.rows_read, chars_read=prior.chars_read,
+        steps=prior.steps, tokens_in=prior.tokens_in, tokens_out=prior.tokens_out,
+        cached_in=prior.cached_in, cost_micro_cny=prior.cost_micro_cny,
+        latency_ms=prior.latency_ms)
+
+
+# 复核失败时，哪些动作绝对不能保留 —— 它们会动账
+_MONEY_ACTIONS = frozenset({"REVERSAL", "SUPPLEMENT"})
+
+
+def safe_review_failure(prior: Solution, why: str) -> Solution:
+    """⭐ 复核失败时的 fail-safe。
+
+    ⚠️ 原实现是 `return prior`，注释还写着「这是安全方向」—— **那是错的。**
+       D05 的 prior 就是 REVERSAL（动账）。真实答案若是 D22（公告已说明渠道
+       会自行更正、明确要求商户不要动账），一次 API 超时就会让系统
+       **执行掉这个项目最想避免的错误动账**。
+
+       「保留确定性结论」在只读场景下是安全的，在动账场景下不是。
+       两类不能共用一种 fallback。
+
+    正确的降级方向：
+      prior 不含动账动作  -> 原样保留（比如 D01 -> CHANNEL_INQUIRY，只是发工单）
+      prior 含动账动作    -> 剥掉动账动作，改为挂起转人工，等人看
+    """
+    if not (set(prior.actions) & _MONEY_ACTIONS):
+        return prior
+
+    kept = [a for a in prior.actions if a not in _MONEY_ACTIONS]
+    if "ESCALATE" not in kept:
+        kept.append("ESCALATE")
+    return Solution(
+        task_id=prior.task_id, root_causes=list(prior.root_causes),
+        actions=kept, expected_status="escalated",
+        confidence=min(prior.confidence, 0.3),
+        notes=(f"复核失败（{why}），规则结论含动账动作 "
+               f"{sorted(set(prior.actions) & _MONEY_ACTIONS)}；"
+               f"在无法确认当日公告是否推翻该结论的情况下**不得动账**，"
+               f"已剥离动账动作并转人工。原结论：{prior.notes or '（未记录）'}"),
+        evidence_refs=list(prior.evidence_refs),
         reads=prior.reads, rows_read=prior.rows_read, chars_read=prior.chars_read,
         steps=prior.steps, tokens_in=prior.tokens_in, tokens_out=prior.tokens_out,
         cached_in=prior.cached_in, cost_micro_cny=prior.cost_micro_cny,

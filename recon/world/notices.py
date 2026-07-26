@@ -212,11 +212,19 @@ class NoticeBoard:
     def _next_day(self, d: str) -> str:
         return (datetime.strptime(d, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
 
-    def _add(self, channel_id: str, date: str, title: str, body: str, **fmt) -> None:
+    def _add(self, channel_id: str, date: str, title: str, body: str,
+             publish_hhmm: str = "09:30", **fmt) -> None:
+        """publish_hhmm：发布时刻。
+
+        ⚠️ 原来所有公告都写死 09:30，于是「随后发布的更正公告」和被它更正的
+           原公告**发布时间完全相同** —— 先后关系只写在正文里，没进时间轴。
+           更正公告必须真的晚于原公告，否则 as_of 切片就切不出「先看到原公告、
+           后看到更正」这个真实过程。
+        """
         self.rows.append({
             "id": f"NT{len(self.rows) + 1:04d}",
             "channel_id": channel_id,
-            "published_at": f"{self._next_day(date)}T09:30:00",
+            "published_at": f"{self._next_day(date)}T{publish_hhmm}:00",
             "effective_from": date,
             "effective_to": date,
             "title": title,
@@ -278,6 +286,7 @@ class NoticeBoard:
         for ch, d in sorted(self.delay_cover)[:2]:
             other = next((c for c in delay_eligible if c != ch), "wxpay")
             self._add(ch, d, RETRACTION[0][0], RETRACTION[0][1],
+                      publish_hhmm="10:30",        # 真的晚于原公告的 09:30
                       other=CHANNELS[other].name)
             self.retracted.add((ch, d))
         self.delay_cover -= self.retracted

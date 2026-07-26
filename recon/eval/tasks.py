@@ -24,6 +24,12 @@ class Task:
     source: str            # match | rule_scan | settlement_scan
     group_key: str         # 同一逻辑问题的多条差错共享它
 
+    # ⭐ 决策时刻。求解方只能看到 published_at <= as_of 的公告。
+    #    ⚠️ 不设它就会出现时间穿越：对账任务在账单日次日 07:00 跑，
+    #       而公告 09:30 才发布，可求解方却能读到 —— 那是未来信息泄漏，
+    #       测出来的指标不符合在线决策流程。
+    as_of: str = ""
+
     # 答案：只有判分器能拿，求解方看不到
     gold_codes: tuple[str, ...] = ()
     gold_actions: tuple[str, ...] = ()
@@ -70,6 +76,7 @@ def load_tasks(conn, *, limit: int | None = None,
     sql = """
         SELECT d.id, d.channel_id, d.bill_date, d.source, d.channel_txn_no,
                d.our_ref_type, d.our_ref_id, d.diff_cents, d.fee_delta_cents,
+               d.created_at,
                g.root_causes, g.correct_actions, g.expected_status,
                g.is_composite, g.explanation
         FROM recon_diffs d JOIN diff_ground_truth g ON g.diff_id = d.id
@@ -96,6 +103,7 @@ def load_tasks(conn, *, limit: int | None = None,
             bill_date=r["bill_date"],
             source=r["source"],
             group_key=group,
+            as_of=r["created_at"],          # 差错被发现的时刻 = 决策时刻
             gold_codes=codes,
             gold_actions=tuple(db.jload(r["correct_actions"]) or ()),
             gold_status=r["expected_status"],

@@ -2,7 +2,10 @@
 
 三件事：
 1. **只允许读 AGENT_VISIBLE_TABLES。** 每个方法显式声明它碰哪些表，运行时断言。
-   答案表在这里读不到，所以「作弊」是物理上做不到的，不靠自觉。
+   答案表在这里读不到，所以「作弊」在接口层被强制拦住，不靠自觉。
+   ⚠️ 措辞要准：这是**接口层强制隔离**，不是数据库级物理隔离 ——
+   同一个 SQLite、同一个连接，只是求解方拿不到绕过 EvidenceView 的路径。
+   要做到真物理隔离得上 set_authorizer 或给求解方独立只读库。
 2. **每次访问都记轨迹。** 取证次数 / 读到多少行 / 花了多少字符，
    于是「规则基线用了几步、agent 用了几步」是可比的。
 3. **返回值预算。** 一次调用最多返回多少行，超了截断并显式告知还有多少。
@@ -133,7 +136,8 @@ class EvidenceView:
             args={"channel": channel_id, "amount": amount_cents,
                   "around": around, "window_min": window_minutes})
 
-    def channel_notices(self, channel_id: str, bill_date: str | None = None) -> list:
+    def channel_notices(self, channel_id: str, bill_date: str | None = None,
+                        as_of: str | None = None) -> list:
         """⭐ 渠道公告 —— 自由文本证据。
 
         这是「规则做不到、模型能做到」的分界点。D21/D22 的结构化证据分别和
@@ -141,12 +145,21 @@ class EvidenceView:
         所以关键词匹配也绕不过去 —— 必须真的读懂内容，还要能把干扰公告排除掉。
         """
         if bill_date:
-            return self._read("channel_notices", ["channel_notices"], """
+            # ⚠️ as_of 过滤是必须的，不是可选的：公告在账单日次日 09:30 发布，
+            #    而对账任务 07:00 就开始跑。不过滤 published_at 就等于让求解方
+            #    读到了两个半小时后才存在的信息 —— 未来信息泄漏。
+            sql = """
                 SELECT * FROM channel_notices
                 WHERE channel_id = ?
                   AND effective_from <= ? AND COALESCE(effective_to, effective_from) >= ?
-                ORDER BY published_at
-            """, (channel_id, bill_date, bill_date), args=[channel_id, bill_date])
+            """
+            params = [channel_id, bill_date, bill_date]
+            if as_of:
+                sql += " AND published_at <= ?"
+                params.append(as_of)
+            sql += " ORDER BY published_at, id"
+            return self._read("channel_notices", ["channel_notices"], sql, params,
+                              args=[channel_id, bill_date, as_of])
         return self._read("channel_notices", ["channel_notices"],
                           "SELECT * FROM channel_notices WHERE channel_id=? ORDER BY published_at",
                           (channel_id,), args=channel_id)
@@ -220,11 +233,19 @@ class EvidenceView:
                           args=settlement_id)
         return rows[0] if rows else None
 
-    def open_diffs(self, bill_date: str, *, exclude: str | None = None) -> list:
+    def open_diffs(self, bill_date: str, *, exclude: str | None = None,
+                   until: str | None = None) -> list:
+        """结算期间内的未平差错。
+
+        ⚠️ 原实现只查 `bill_date = ?` 一天。结算单有 period_start~period_end，
+           周结渠道跨 7 天 —— 只查首日的语义是错的。
+        """
+        end = until or bill_date
         return self._read("open_diffs", ["recon_diffs"], """
-            SELECT id, channel_id, diff_cents, status FROM recon_diffs
-            WHERE bill_date=? AND status='new' AND id != COALESCE(?, '')
-        """, (bill_date, exclude), args=[bill_date, exclude])
+            SELECT id, channel_id, bill_date, diff_cents, status FROM recon_diffs
+            WHERE bill_date BETWEEN ? AND ? AND status='new'
+              AND id != COALESCE(?, '')
+        """, (bill_date, end, exclude), args=[bill_date, end, exclude])
 
     # ---------------------------------------------------------- 政策文档
     def policy_list(self) -> list[str]:

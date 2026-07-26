@@ -652,3 +652,78 @@ def test_every_designed_hard_scenario_has_enough_samples(world):
     detail = "\n".join(f"  {name}: {n} 条（要求 ≥{need}）" for name, n, need, _ in rows)
     assert not bad, ("有难点场景样本不足，指标会失去分辨力：\n"
                      + "\n".join(bad) + "\n\n各场景实际条数：\n" + detail)
+
+
+# --------------------------------------------------------------------------
+# 时间语义：不能读到未来的公告，也不能看不到该看的公告
+# --------------------------------------------------------------------------
+
+def test_no_future_notice_leak(world):
+    """⭐ 求解方在决策时刻不得读到之后才发布的公告。
+
+    这是一个很容易漏掉的泄漏：公告查询原来只过滤 effective_from/to，不看
+    published_at。而对账任务当时定在账单日次日 07:00，公告 09:30 才发布 ——
+    求解方在 07:00 就读到了两个半小时后才存在的信息，指标不符合在线决策流程。
+    """
+    from recon.eval.evidence import EvidenceView
+    from recon.eval.tasks import load_tasks
+    ev = EvidenceView(world)
+    bad = []
+    for t in load_tasks(world):
+        if not t.as_of:
+            bad.append(f"{t.task_id} 没有 as_of，无法约束可见性")
+            continue
+        for n in ev.channel_notices(t.channel_id, t.bill_date, as_of=t.as_of):
+            if n["published_at"] > t.as_of:
+                bad.append(f"{t.task_id} as_of={t.as_of} 读到了 "
+                           f"{n['id']}（发布于 {n['published_at']}）")
+    assert not bad, "读到了未来才发布的公告：\n" + "\n".join(bad[:10])
+
+
+def test_covering_notices_are_visible_at_decision_time(cases, world):
+    """反向守卫：D21/D22 依赖的覆盖性公告必须在决策时刻**已经发布**。
+
+    卡得太早同样是错的 —— 那样覆盖性公告一条都看不见，D21/D22 全变成
+    不可解标注，整个自由文本证据层就白做了。两个方向都要守。
+    """
+    from recon.eval.evidence import EvidenceView
+    from recon.eval.tasks import load_tasks
+    from recon.world.notices import COVERING_TITLES
+    ev = EvidenceView(world)
+    by_id = {t.diff_id: t for t in load_tasks(world)}
+    bad = []
+    for c in cases:
+        codes = set(c["substantive"])
+        if not (codes & {"D21", "D22"}):
+            continue
+        t = by_id.get(c["diff"]["id"])
+        if t is None:
+            continue
+        seen = {n["title"] for n in
+                ev.channel_notices(t.channel_id, t.bill_date, as_of=t.as_of)}
+        if not (seen & COVERING_TITLES):
+            bad.append(f"{t.task_id} 标了 {sorted(codes)}，但在 as_of={t.as_of} "
+                       f"时看不到任何覆盖性公告 —— 该标注不可解")
+    assert not bad, "覆盖性公告在决策时刻还没发布：\n" + "\n".join(bad[:10])
+
+
+def test_retraction_is_published_after_what_it_retracts(world):
+    """更正公告必须真的晚于被它更正的原公告。
+
+    原实现所有公告都写死 09:30，先后关系只写在正文里、没进时间轴 ——
+    那样 as_of 切片就切不出「先看到原公告、后看到更正」这个真实过程。
+    """
+    from recon.world.notices import DELAY_TITLES, RETRACTION_TITLES
+    bad = []
+    for r in db.q(world, "SELECT * FROM channel_notices WHERE title IN (%s)"
+                  % ",".join("?" * len(RETRACTION_TITLES)), sorted(RETRACTION_TITLES)):
+        originals = db.q(world, """
+            SELECT published_at, id FROM channel_notices
+            WHERE channel_id=? AND effective_from=? AND title IN (%s)"""
+            % ",".join("?" * len(DELAY_TITLES)),
+            [r["channel_id"], r["effective_from"], *sorted(DELAY_TITLES)])
+        for o in originals:
+            if r["published_at"] <= o["published_at"]:
+                bad.append(f"更正 {r['id']}({r['published_at']}) 不晚于原公告 "
+                           f"{o['id']}({o['published_at']})")
+    assert not bad, "更正公告的时间轴不成立：\n" + "\n".join(bad[:10])

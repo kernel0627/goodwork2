@@ -60,18 +60,25 @@ class _Oracle:
 # --------------------------------------------------- 失败不能伪装成结果
 
 def test_total_failure_is_reported_not_disguised(world, tmp_path):
-    """13 条全调用失败时，fail-safe 会把它们全标成 delay —— 那是一个
-    看起来完全正常的分类结果。必须有一个字段把这件事暴露出来。
+    """全部调用失败时，必须从三个地方都能看出来，不能伪装成正常分类结果。
 
-    这不是假想：账户欠费时真的发生过，统计出来「危险方向漏标 0 条」，
-    不拿 oracle 对一遍根本看不出来。
+    这不是假想：账户欠费时真的发生过 —— 当时兜底标签是 `delay`，
+    `by_label` 看起来完全正常（就是一堆 delay），统计出来「危险方向漏标 0 条」，
+    不拿 oracle 对一遍根本看不出问题。
+
+    现在兜底标签改成了 `unknown_covering`，它**自己就会暴露**：
+      1. by_label 里出现一个明显不是正常标签的值；
+      2. fallbacks 计数等于公告总数；
+      3. trustworthy 为 False。
+    三道都要守住 —— 只靠 by_label 的话，哪天兜底标签又被改回 delay 就失效了。
     """
     labels = nc.classify_all(world, _Boom(), cache_path=tmp_path / "c.json")
     s = nc.label_stats(labels)
-    assert s["fallbacks"] == s["notices"]
-    assert s["trustworthy"] is False
-    # by_label 单看是完全正常的，这正是危险所在
-    assert set(s["by_label"]) == {nc.DELAY}
+    assert s["fallbacks"] == s["notices"], "兜底计数必须等于公告总数"
+    assert s["trustworthy"] is False, "全失败时不能报 trustworthy"
+    assert set(s["by_label"]) == {nc.UNKNOWN_COVERING}, (
+        "兜底标签必须是自暴露的 unknown_covering，"
+        "不能是 delay/fee 这种看起来像正常分类结果的值")
 
 
 def test_fallback_labels_are_never_cached(world, tmp_path):
@@ -184,3 +191,75 @@ def test_oracle_labels_match_the_world(world):
     got = set(_oracle(world).values())
     assert got <= {nc.DELAY, nc.FEE, nc.NONE}
     assert {nc.DELAY, nc.FEE} <= got, "世界里应当同时存在两类覆盖性公告"
+
+
+def test_fee_notice_classification_failure_still_routes_d22(world, tmp_path):
+    """⭐ 组合级安全：一条**费率**公告分类失败，D22 仍然必须被路由。
+
+    这是一个单模块看起来 fail-safe、组合起来却不安全的典型：
+      旧实现兜底回落到 delay
+        -> covering_dates 只把它放进 delay 集合
+        -> typed 闸门里 D05 查的是 fee 集合，查不到
+        -> 该差错不进复核器
+        -> 规则直接执行 REVERSAL = 错误动账
+
+    注释里写着「失败一律当覆盖性」，但 delay 只对 D01 是覆盖性，对 D05 不是。
+    现在兜底标签同时进两个集合，宁可多路由（白花钱）也不能漏路由（动错账）。
+    """
+    labels = nc.classify_all(world, _Oracle(world), use_cache=False)
+
+    # 把一条承载 D22 的费率公告改成兜底状态
+    d22_dates = {(t.channel_id, t.bill_date) for t in load_tasks(world)
+                 if "D22" in t.gold_codes}
+    target = None
+    for nid, v in labels.items():
+        if v["label"] != nc.FEE:
+            continue
+        row = db.q1(world, "SELECT channel_id, effective_from FROM channel_notices "
+                           "WHERE id=?", (nid,))
+        if row and (row["channel_id"], row["effective_from"]) in d22_dates:
+            target = nid
+            break
+    assert target, "没有承载 D22 的费率公告，世界构造有问题"
+    labels[target]["label"] = nc.UNKNOWN_COVERING
+    labels[target]["fallback"] = True
+
+    covering = nc.covering_dates(world, labels)
+    ev, rules = EvidenceView(world), RuleBaseline()
+    missed = [t for t in load_tasks(world)
+              if "D22" in t.gold_codes
+              and not route_reason(rules.solve(t, ev), t, ev, covering)[0]]
+    assert not missed, (
+        f"费率公告分类失败后有 {len(missed)} 条 D22 被漏路由 —— "
+        f"它们会被规则直接 REVERSAL，这就是错误动账")
+
+
+def test_unknown_covering_lands_in_both_label_sets(world):
+    """兜底标签必须同时出现在 delay 与 fee 两个集合里。"""
+    labels = nc.classify_all(world, _Oracle(world), use_cache=False)
+    nid = next(iter(labels))
+    row = db.q1(world, "SELECT channel_id, effective_from FROM channel_notices WHERE id=?",
+                (nid,))
+    labels[nid]["label"] = nc.UNKNOWN_COVERING
+    cov = nc.covering_dates(world, labels)
+    pair = (row["channel_id"], row["effective_from"])
+    assert pair in cov[nc.DELAY] and pair in cov[nc.FEE]
+
+
+def test_cache_key_includes_schema_and_model_version(world, tmp_path):
+    """缓存 key 必须带版本：只用 body hash 的话，改了分类标准或换了模型之后
+    旧缓存照旧命中，你会拿旧标准的标签当成新标准的结果。"""
+    import os
+    row = db.q1(world, "SELECT * FROM channel_notices LIMIT 1")
+    k1 = nc._key(row)
+    old = nc.SCHEMA_VERSION
+    try:
+        nc.SCHEMA_VERSION = old + "-bumped"
+        assert nc._key(row) != k1, "改了 SCHEMA_VERSION 后 key 必须变"
+    finally:
+        nc.SCHEMA_VERSION = old
+    os.environ["RECON_AGENT_MODEL"] = "some-other-model"
+    try:
+        assert nc._key(row) != k1, "换了模型后 key 必须变"
+    finally:
+        os.environ.pop("RECON_AGENT_MODEL", None)

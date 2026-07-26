@@ -64,7 +64,8 @@ class AgentRunner:
     # ------------------------------------------------------------------
     def run(self, task: Task, ev: EvidenceView) -> RunResult:
         ev.reset_trace()
-        box = ToolBox(ev, strip_injection_policy=self.cfg.strip_injection_policy)
+        box = ToolBox(ev, strip_injection_policy=self.cfg.strip_injection_policy,
+                      as_of=task.as_of or None)
         t_start = time.time()
 
         messages: list[dict] = [

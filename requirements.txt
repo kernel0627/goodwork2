@@ -16,9 +16,11 @@ pytest>=9.1         # 测试
 # ---- 阶段 1 预计用到的（大概率仍然不用装）----
 # pandas>=2.3       # 出指标表；已装。也可以直接用 stdlib csv，视情况决定
 
-# ---- 阶段 2 起（Agent）预计用到的 ----
-# openai>=2.45      # 已装。用它的 SDK 配 base_url 打 DeepSeek / Qwen / 智谱，
-#                   # 不需要为每家再装一个 SDK
+# ---- Agent / 复核器 ----
+openai>=2.45        # ⭐ 跑 agent/复核器必需。用它的 SDK 配 base_url 打 DeepSeek，
+                    # 不需要为每家模型再装一个 SDK。
+                    # ⚠️ 原来这行是注释掉的 —— 外部用户 pip install 之后
+                    #    agent 相关命令全跑不起来。
 #
 # 明确不打算引入：
 #   sqlalchemy      —— 手写 SQL 就够，且 SQL 本身是这个项目要展示的东西

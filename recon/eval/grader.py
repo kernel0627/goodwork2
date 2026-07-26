@@ -235,9 +235,14 @@ def aggregate(solver: str, tasks: list[Task], sols: dict[str, Solution]) -> Repo
         "any_risk_rate": _rate(sum(g.any_risk for g in grades), n),
         "total_amount": total_amount,
 
+        # precision = 正确升级 / **所有预测为升级的**。
+        # ⚠️ 原实现分母写成「真实需升级总数 + 过度升级数」，把漏升级的 FN
+        #    也塞进了 precision 分母 —— 那是 recall 的分母，不是 precision 的。
         "escalation_precision": _rate(
             sum(1 for g in grades if g.gold_status == "escalated" and not g.missed_escalation),
-            sum(1 for g in grades if g.gold_status == "escalated") + sum(g.over_escalation for g in grades)),
+            sum(1 for g in grades
+                if (g.gold_status == "escalated" and not g.missed_escalation)
+                or g.over_escalation)),
         "escalation_recall": _rate(
             sum(1 for g in grades if g.gold_status == "escalated" and not g.missed_escalation),
             sum(1 for g in grades if g.gold_status == "escalated")),

@@ -31,9 +31,21 @@ def _routed_task(world):
     pytest.skip("样本里没有被路由的任务")
 
 
-def _covered(code="D21", nid="NT0001"):
+def _covered(code="D21", nid=None):
+    """⚠️ notice_id 必须是该任务**实际可见**的公告之一。
+
+    校验器会拦住不属于本次输入的 notice_id —— 模型不能引用一条它没看到的公告
+    来支撑改判。所以这里不能写死一个 ID，得从任务的可见公告里取。
+    """
     return {"covered": True, "notice_id": nid, "override": code,
             "reasoning": "公告正文说明当日部分明细未进入对账文件、将随次日补发"}
+
+
+def _first_visible_notice(world, task):
+    from recon.eval.evidence import EvidenceView
+    rows = EvidenceView(world).channel_notices(task.channel_id, task.bill_date,
+                                               as_of=task.as_of or None)
+    return rows[0]["id"] if rows else None
 
 
 def _not_covered():
@@ -89,7 +101,7 @@ def test_reviewer_keeps_the_rule_conclusion_when_not_covered(world):
 def test_reviewer_overrides_when_covered(world):
     task, prior = _routed_task(world)
     src = next(c for c in prior.root_causes if c in OVERRIDE)
-    llm = FakeLLM([_covered(OVERRIDE[src])])
+    llm = FakeLLM([_covered(OVERRIDE[src], _first_visible_notice(world, task))])
     out = NoticeReviewer(llm).solve(task, EvidenceView(world), prior=prior)
     assert OVERRIDE[src] in out.root_causes
     assert out.expected_status == "held"
@@ -109,20 +121,82 @@ def test_reviewer_cannot_invent_a_new_attribution(world):
     assert out.root_causes == before
 
 
-def test_reviewer_falls_back_to_the_rule_on_llm_failure(world):
-    """复核挂了就维持规则结论。失败时改判等于凭空动账。"""
-    class Boom:
-        name = "boom"
+class _Boom:
+    name = "boom"
 
-        def complete_json(self, messages, **kw):
-            raise LLMError("模拟调用失败")
+    def complete_json(self, messages, **kw):
+        raise LLMError("模拟调用失败")
 
-    task, prior = _routed_task(world)
-    before = list(prior.root_causes)
-    rv = NoticeReviewer(Boom())
+
+class _Fatal:
+    name = "fatal"
+
+    def complete_json(self, messages, **kw):
+        from recon.agent.llm import LLMFatalError
+        raise LLMFatalError("Insufficient Balance")
+
+
+def _prior_with(actions, codes, status="closed"):
+    from recon.eval.solution import Solution
+    return Solution(task_id="T", root_causes=list(codes), actions=list(actions),
+                    expected_status=status, confidence=0.9, notes="规则结论")
+
+
+def test_readonly_prior_is_preserved_on_llm_failure(world):
+    """prior 不含动账动作时（D01 -> CHANNEL_INQUIRY，只是发工单），
+    复核失败保留规则结论是安全的。"""
+    task, _ = _routed_task(world)
+    prior = _prior_with(["CHANNEL_INQUIRY"], ["D01"], "held")
+    rv = NoticeReviewer(_Boom())
     out = rv.solve(task, EvidenceView(world), prior=prior)
-    assert out.root_causes == before
+    assert out.root_causes == ["D01"]
+    assert out.actions == ["CHANNEL_INQUIRY"]
     assert rv.results[-1].error and not rv.results[-1].overridden
+
+
+def test_money_action_prior_must_not_survive_llm_failure(world):
+    """⭐ P0：prior 含动账动作时，复核失败**绝不能**保留它。
+
+    原实现是 `return prior`，注释还写着「这是安全方向」—— 那是错的：
+    D05 的 prior 就是 REVERSAL。真实答案若是 D22（公告已说明渠道会自行更正、
+    明确要求商户不要动账），一次 API 超时就会让系统执行掉这个项目
+    **最想避免的错误动账**。
+
+    「保留确定性结论」在只读场景下安全，在动账场景下不安全。两类不能共用 fallback。
+    """
+    task, _ = _routed_task(world)
+    prior = _prior_with(["REVERSAL"], ["D05"], "closed")
+    out = NoticeReviewer(_Boom()).solve(task, EvidenceView(world), prior=prior)
+
+    assert "REVERSAL" not in out.actions, "复核失败后仍保留了 REVERSAL —— 会错误动账"
+    assert "SUPPLEMENT" not in out.actions
+    assert "ESCALATE" in out.actions, "剥掉动账动作后必须转人工"
+    assert out.expected_status == "escalated"
+    assert out.root_causes == ["D05"], "归因不该变 —— 我们只是不确定公告是否推翻它"
+    assert "不得动账" in out.notes
+
+
+def test_composite_prior_keeps_readonly_actions_and_drops_money_ones(world):
+    """复合差错（D05,D11）：冲正要剥掉，丢弃重复明细这种只读动作可以留。"""
+    task, _ = _routed_task(world)
+    prior = _prior_with(["REVERSAL", "DISCARD_DUPLICATE"], ["D05", "D11"])
+    out = NoticeReviewer(_Boom()).solve(task, EvidenceView(world), prior=prior)
+    assert "REVERSAL" not in out.actions
+    assert "DISCARD_DUPLICATE" in out.actions
+    assert "ESCALATE" in out.actions
+
+
+def test_fatal_error_aborts_instead_of_degrading(world):
+    """⭐ P0：LLMFatalError（余额/密钥/权限）必须穿透，不能被吞成「维持规则结论」。
+
+    LLMFatalError 继承自 LLMError。多轮 agent loop 已经正确地先捕获它再抛出，
+    但复核器原来没有单独处理 —— 于是 402 欠费会让 336 条全部静默退化成规则结论，
+    其中含 D05 的那些直接动账，而报表上看不出任何异常。
+    """
+    from recon.agent.llm import LLMFatalError
+    task, prior = _routed_task(world)
+    with pytest.raises(LLMFatalError):
+        NoticeReviewer(_Fatal()).solve(task, EvidenceView(world), prior=prior)
 
 
 def test_reviewer_sees_notice_bodies_but_not_the_answer(world):
@@ -250,3 +324,56 @@ def test_prompt_has_no_fee_block_when_there_is_no_fee_dimension(world):
     prior = Solution(task_id="T1", root_causes=["D01"], actions=["CHANNEL_INQUIRY"])
     from recon.agent.reviewer import _fee_block
     assert _fee_block(prior.facts) == ""
+
+
+# ------------------------------------------------- 复核输出的严格校验
+
+def test_string_false_is_not_treated_as_covered(world):
+    """⭐ `{"covered": "false"}` 不能被当成 True。
+
+    原实现是 `bool(data.get("covered"))` —— 非空字符串在 Python 里是 True，
+    于是模型返回字符串 "false" 会被读成「公告覆盖」，凭空改判。
+    这类隐式类型转换在动账系统里是不可接受的。
+    """
+    task, prior = _routed_task(world)
+    llm = FakeLLM([{"covered": "false", "notice_id": None, "override": None,
+                    "reasoning": "字符串而不是布尔"}])
+    rv = NoticeReviewer(llm)
+    out = rv.solve(task, EvidenceView(world), prior=prior)
+    assert not rv.results[-1].overridden, "字符串 'false' 被当成了覆盖"
+    assert rv.results[-1].error, "非法输出必须被记为错误，不能静默通过"
+    # 走安全兜底：prior 里的动账动作不许留
+    assert "REVERSAL" not in out.actions
+
+
+def test_notice_id_must_belong_to_the_provided_notices(world):
+    """模型不能引用一条它根本没看到的公告来支撑改判。"""
+    task, prior = _routed_task(world)
+    src = next(c for c in prior.root_causes if c in OVERRIDE)
+    llm = FakeLLM([_covered(OVERRIDE[src], "NT9999")])
+    rv = NoticeReviewer(llm)
+    rv.solve(task, EvidenceView(world), prior=prior)
+    assert not rv.results[-1].overridden
+    assert "不属于本次提供的公告" in (rv.results[-1].error or "")
+
+
+def test_override_must_match_a_code_in_the_prior(world):
+    """改判目标对应的源编码必须真的在规则结论里，否则无从改判。"""
+    task, prior = _routed_task(world)
+    other = "D22" if "D05" not in prior.root_causes else "D21"
+    if other == "D21" and "D01" in prior.root_causes:
+        pytest.skip("这条任务的规则结论同时含 D01/D05，构造不出反例")
+    llm = FakeLLM([_covered(other, _first_visible_notice(world, task))])
+    rv = NoticeReviewer(llm)
+    rv.solve(task, EvidenceView(world), prior=prior)
+    assert not rv.results[-1].overridden
+
+
+def test_covered_false_with_override_is_rejected(world):
+    """covered=false 却给了 override —— 自相矛盾，必须拒掉。"""
+    task, prior = _routed_task(world)
+    llm = FakeLLM([{"covered": False, "notice_id": None, "override": "D21",
+                    "reasoning": "自相矛盾"}])
+    rv = NoticeReviewer(llm)
+    rv.solve(task, EvidenceView(world), prior=prior)
+    assert rv.results[-1].error

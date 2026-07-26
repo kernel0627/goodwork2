@@ -76,7 +76,8 @@ class RuleBaseline:
         if m is None:
             return []
         refs.append(f"merchants:{m['id']}")
-        others = ev.open_diffs(s["period_start"], exclude=diff["id"])
+        others = ev.open_diffs(s["period_start"], exclude=diff["id"],
+                               until=s["period_end"])
         if s["status"] == "paid" and m["allow_advance"] == 0 and others:
             return [Fire("D16", f"商户 {m['id']} allow_advance=0，{s['period_start']} "
                                 f"存在 {len(others)} 条未平差错，结算单已 paid")]

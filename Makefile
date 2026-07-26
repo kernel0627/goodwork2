@@ -1,4 +1,9 @@
-PY := /Users/traegang/miniforge3/envs/agent/bin/python
+# 解释器可覆盖：优先用环境里的 PY，其次找 conda 的 agent 环境，最后退回 python3。
+# ⚠️ 原来硬编码成作者本机的绝对路径，别人 clone 下来一条命令都跑不了。
+PY ?= $(shell command -v python >/dev/null 2>&1 && echo python || echo python3)
+ifneq ($(wildcard $(HOME)/miniforge3/envs/agent/bin/python),)
+PY := $(HOME)/miniforge3/envs/agent/bin/python
+endif
 
 SEED   ?= 42
 START  ?= 2026-07-01
@@ -6,7 +11,8 @@ DAYS   ?= 7
 ORDERS ?= 200
 INJECT ?= 120
 
-.PHONY: help build test check stats report case case-composite repro clean all tasks baseline agent replay
+.PHONY: help build test check stats report case case-composite repro clean all \
+        tasks baseline agent replay variance ablate route scenarios
 
 help:
 	@echo "make build            生成完整业务世界 + 带答案的差错池（一条命令）"
@@ -20,6 +26,10 @@ help:
 	@echo "make baseline         跑纯规则基线并判分（阶段 1 核心动作）"
 	@echo "make agent            跑 Agent 并与规则基线同表对比（阶段 2 核心动作）"
 	@echo "make replay           回放一条判错的 agent 轨迹"
+	@echo "make route            规则优先路由 + 单次复核（核心交付物）"
+	@echo "make route-dry        只跑闸门，看要花多少钱"
+	@echo "make variance         同配置重复跑，量方差与 pass^k"
+	@echo "make ablate           消融阶梯"
 	@echo "make repro            验证同 seed 可复现"
 	@echo "make all              build + test + report"
 	@echo ""
@@ -61,6 +71,21 @@ agent:
 
 replay:
 	$(PY) -m recon.cli replay --failed-only
+
+VAR_REPEAT ?= 3
+SPLIT      ?= all
+
+variance:
+	$(PY) -m recon.cli variance --repeat $(VAR_REPEAT) --split $(SPLIT) --workers $(AGENT_WORKERS)
+
+ablate:
+	$(PY) -m recon.cli ablate --limit $(AGENT_LIMIT) --workers $(AGENT_WORKERS)
+
+route:
+	$(PY) -m recon.cli route --all-tasks --mode review --gate any --workers $(AGENT_WORKERS)
+
+route-dry:
+	$(PY) -m recon.cli route --all-tasks --dry-run
 
 repro:
 	$(PY) -m recon.cli verify-repro
