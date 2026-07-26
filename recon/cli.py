@@ -509,15 +509,22 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
 @click.option("--workers", default=12, show_default=True)
 @click.option("--model", default=None)
 @click.option("--dry-run", is_flag=True, help="只跑闸门，不调模型 —— 先看要花多少钱")
+@click.option("--mode", type=click.Choice(["review", "resolve"]), default="review",
+              show_default=True,
+              help="review=单次调用复核规则结论；resolve=让完整 agent 从零重解")
 @click.option("--save/--no-save", default=True)
 def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
-              model: str | None, dry_run: bool, save: bool) -> None:
-    """规则优先路由 —— 规则先跑，只把它注定读不到的那部分交给 agent。
+              model: str | None, dry_run: bool, mode: str, save: bool) -> None:
+    """规则优先路由 —— 规则先跑，只把它注定读不到的那部分交给模型。
 
     --dry-run 只跑闸门：路由比例、需读文本召回、放行部分正确率，全部零 token。
     先看这个再决定要不要真的跑。
+
+    两种 inner 的区别是输出空间：review 只能维持或 D01→D21 / D05→D22，
+    resolve 可以给出任意归因 —— 所以闸门误触的那些题在 review 下更安全。
     """
     from .agent.llm import DeepSeekClient
+    from .agent.reviewer import review_stats, run_review
     from .agent.solver import run_agent
     from .baseline.rules import RuleBaseline, run_baseline
     from .eval import report as rp
@@ -565,22 +572,40 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
         conn.close()
         return
 
-    # ---- 只对被路由的那批跑 agent ----
+    # ---- 只对被路由的那批调模型 ----
     client = DeepSeekClient(model=model)
-    console.print(f"\n模型 [cyan]{client.name}[/]，只跑被路由的 {s['routed']} 条")
+    console.print(f"\n模型 [cyan]{client.name}[/]，模式 [cyan]{mode}[/]，"
+                  f"只跑被路由的 {s['routed']} 条")
 
-    def inner_run(batch):
-        sols, _ = run_agent(db_path, batch, llm=client, workers=workers)
-        return sols
+    stats = None
+    if mode == "review":
+        def inner_run(batch, priors):
+            nonlocal stats
+            sols_, results = run_review(db_path, batch, priors,
+                                        llm=client, workers=workers)
+            stats = review_stats(results)
+            return sols_
+        merge = False           # 复核方自己累加成本
+    else:
+        def inner_run(batch, _priors):
+            sols_, _ = run_agent(db_path, batch, llm=client, workers=workers)
+            return sols_
+        merge = True
 
-    sols, _ = run_router(db_path, tasks, inner_run=inner_run)
+    sols, _ = run_router(db_path, tasks, inner_run=inner_run, merge=merge)
+
+    if stats:
+        console.print(f"复核 {stats['reviewed']} 条：改判 [cyan]{stats['overridden']}[/]、"
+                      f"维持 {stats['kept']}、失败 {stats['errors']}；"
+                      f"平均输入 {stats['avg_tokens_in']:.0f} token"
+                      f"（缓存命中 {stats['cached_rate']:.0%}）")
 
     reps = [aggregate("rule_baseline", tasks, run_baseline(conn, tasks)),
-            aggregate(f"router({client.name})", tasks, sols)]
+            aggregate(f"router-{mode}({client.name})", tasks, sols)]
     console.rule("[bold]规则基线 vs 规则优先路由[/]")
     rp.print_comparison(reps)
     if save:
-        p = DOCS / "stage4_router.md"
+        p = DOCS / f"stage4_router_{mode}.md"
         p.write_text(rp.comparison_markdown(reps, tasks=tasks), encoding="utf-8")
         console.print(f"[green]已写入[/] {p}")
     conn.close()

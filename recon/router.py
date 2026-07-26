@@ -64,6 +64,17 @@ class Solver(Protocol):
     def solve(self, task: Task, ev: EvidenceView) -> Solution: ...
 
 
+def wants_prior(inner: object) -> bool:
+    """inner 是「复核方」还是「重解方」。
+
+    复核方（NoticeReviewer）声明 wants_prior=True，会拿到规则的结论作为先验，
+    输出空间被限制成「维持」或「D01→D21 / D05→D22」；重解方（AgentSolver）
+    从零开始，输出空间是全部编码。两者接口不同，这里显式分流而不是
+    try/except TypeError —— 后者会把 inner 内部真正的 TypeError 吞掉。
+    """
+    return bool(getattr(inner, "wants_prior", False))
+
+
 @dataclass(frozen=True)
 class RouteDecision:
     task_id: str
@@ -116,6 +127,9 @@ class RouterSolver:
             raise RuntimeError(
                 f"{task.task_id} 需要路由，但 RouterSolver 没有 inner 求解方。"
                 "只跑闸门请用 decide()。")
+        if wants_prior(self.inner):
+            # 复核方自己就是在规则结论上改，成本也已由它累加，不再走 _merge
+            return self.inner.solve(task, ev, prior=sol)
         return self._merge(sol, self.inner.solve(task, ev))
 
     # ------------------------------------------------------------------
@@ -148,14 +162,19 @@ class RouterSolver:
 # --------------------------------------------------------------------------
 
 def run_router(db_path: str | Path | None, tasks: Iterable[Task], *,
-               inner_run: Callable[[list[Task]], dict[str, Solution]],
+               inner_run: Callable[[list[Task], dict[str, Solution]],
+                                   dict[str, Solution]],
                rules: RuleBaseline | None = None,
+               merge: bool = True,
                ) -> tuple[dict[str, Solution], list[RouteDecision]]:
     """批量跑。闸门是零成本的，所以先单线程全跑一遍规则，再把被路由的那批
     交给 inner_run 并发处理 —— 而不是每条任务都进线程池。
 
-    inner_run 收一批任务、返回 {task_id: Solution}，签名刻意与 run_agent 的
-    返回对齐，方便直接包一层 lambda 传进来。
+    inner_run 收 (被路由的任务, 全部规则结论)，返回 {task_id: Solution}。
+    第二个参数是给复核方用的先验；重解方忽略它即可。
+
+    merge=True 时把规则那一趟的取证成本加到 inner 的结果上（重解方走这条）；
+    复核方自己就是在规则结论上改、成本已经累加过，传 merge=False。
     """
     tasks = list(tasks)
     conn = db.connect(db_path)
@@ -174,8 +193,9 @@ def run_router(db_path: str | Path | None, tasks: Iterable[Task], *,
 
     out = dict(rule_sols)
     if routed:
-        for tid, agent_sol in inner_run(routed).items():
-            out[tid] = RouterSolver._merge(rule_sols[tid], agent_sol)
+        for tid, inner_sol in inner_run(routed, rule_sols).items():
+            out[tid] = (RouterSolver._merge(rule_sols[tid], inner_sol)
+                        if merge else inner_sol)
     return out, router.decisions
 
 
