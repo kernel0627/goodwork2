@@ -419,13 +419,17 @@ def _covering_notice_titles(world, channel_id, bill_date) -> set[str]:
 
 
 def test_d21_has_a_covering_delay_notice(cases, world):
-    """D21 的判据只在公告正文里，所以必须真的存在一条覆盖性延迟公告。"""
-    from recon.world.notices import DELAY_TITLES
+    """D21 的判据只在公告正文里，所以必须真的存在一条覆盖性延迟公告。
+
+    覆盖性包括「整天覆盖」和「部分时段覆盖」两种 —— 后者是阶段 5 新增的难点，
+    窗内才算覆盖，窗口本身由 test_d21_inside_window_when_notice_is_scoped 守。
+    """
+    from recon.world.notices import DELAY_TITLES, SCOPED_TITLES
     bad = []
     for c in _containing(cases, "D21"):
         d = c["diff"]
         titles = _covering_notice_titles(world, d["channel_id"], d["bill_date"])
-        if not (titles & DELAY_TITLES):
+        if not (titles & (DELAY_TITLES | SCOPED_TITLES)):
             bad.append(f"{d['id']} 标了 D21 但 {d['channel_id']}/{d['bill_date']} "
                        f"没有延迟下发公告，判据无从获得（当前公告：{titles}）")
     assert not bad, "D21 标注不可解：\n" + "\n".join(bad[:10])
@@ -443,20 +447,26 @@ def test_d22_has_a_covering_fee_notice(cases, world):
     assert not bad, "D22 标注不可解：\n" + "\n".join(bad[:10])
 
 
-def test_d01_is_not_covered_by_a_delay_notice(cases, world):
-    """反向守卫：D01 若落在有延迟公告的日子上，正确答案其实是 D21，两类会互相污染。
+def test_d01_is_not_covered_by_an_unqualified_delay_notice(cases, world):
+    """反向守卫：D01 不能落在「无条件整天覆盖」的日子上，那种情形答案是 D21。
 
-    ⚠️ 必须用 _containing（含复合）。只查原子是这个项目里犯了三次的同一个错：
-       D03 落到四舍五入渠道、D04 落到 gross 口径渠道、D05 落到费率公告覆盖的日子，
-       三次都是复合路径绕过了原子路径的守卫。
+    阶段 5 之后有两种合法例外，必须放行，否则会把正确标注判成错的：
+      - 当日还有**更正公告**把本渠道排除掉（RETRACTION）；
+      - 公告只覆盖某个**时间窗**（SCOPED），本笔在窗外。
+    窗口本身由 test_d01_outside_window_or_not_covered 精确校验。
+
+    ⚠️ 必须用 _containing（含复合）。只查原子是这个项目里犯了三次的同一个错。
     """
-    from recon.world.notices import DELAY_TITLES
+    from recon.world.notices import DELAY_TITLES, RETRACTION_TITLES, SCOPED_TITLES
     bad = []
     for c in _containing(cases, "D01"):
         d = c["diff"]
         titles = _covering_notice_titles(world, d["channel_id"], d["bill_date"])
-        if titles & DELAY_TITLES:
-            bad.append(f"{d['id']} 标 D01，但当日有延迟下发公告，应判 D21")
+        if not (titles & DELAY_TITLES):
+            continue
+        if titles & (RETRACTION_TITLES | SCOPED_TITLES):
+            continue                     # 合法例外
+        bad.append(f"{d['id']} 标 D01，但当日有无条件的整天延迟公告，应判 D21")
     assert not bad, "D01 与 D21 标注互相污染：\n" + "\n".join(bad[:10])
 
 
@@ -511,3 +521,134 @@ def test_d19_never_changes_the_correct_action(cases):
             bad.append(f"{c['diff']['id']} 带 D19 后答案变成 {c['actions']}/{c['status']}，"
                        f"应仍为 [{spec.action}]/{spec.expected_status}")
     assert not bad, "提示注入改变了正确答案：\n" + "\n".join(bad[:10])
+
+
+# --------------------------------------------------------------------------
+# 阶段 5 新增难点：部分时段适用 / 近似但不覆盖 / 后续收窄
+# --------------------------------------------------------------------------
+
+def _notice_titles(world, channel_id, bill_date) -> set[str]:
+    return {r["title"] for r in db.q(world, """
+        SELECT title FROM channel_notices WHERE channel_id=?
+          AND effective_from <= ? AND COALESCE(effective_to, effective_from) >= ?
+    """, (channel_id, bill_date, bill_date))}
+
+
+def _txn_time(world, txn):
+    r = db.q1(world, "SELECT occurred_at FROM channel_bill_records WHERE channel_txn_no=?",
+              (txn,))
+    if r:
+        return r["occurred_at"]
+    r = db.q1(world, "SELECT paid_at FROM payments WHERE channel_txn_no=?", (txn,))
+    return r["paid_at"] if r else None
+
+
+def test_scoped_notices_exist_and_are_the_hard_case(world):
+    """必须真的有「只覆盖某个时间窗」的公告。
+
+    这是阶段 5 的核心难点：同一个 (渠道, 账单日) 上，窗内的差错是 D21、
+    窗外的是 D01 —— **闸门在结构上分不开**，必须读懂窗口并比对交易时刻。
+    阶段 4 跑到 100% 就是因为当时没有这种情形。
+    """
+    from recon.world.notices import SCOPED_TITLES
+    titles = {r["title"] for r in db.q(world, "SELECT DISTINCT title FROM channel_notices")}
+    assert titles & SCOPED_TITLES, "没有部分时段适用的公告，世界还是太容易"
+
+
+def test_near_miss_notices_exist(world):
+    """必须有「主题看着相关、正文明确不覆盖」的公告 —— 读一半就会误判。"""
+    from recon.world.notices import NEAR_MISS_DELAY_TITLES, NEAR_MISS_FEE_TITLES
+    titles = {r["title"] for r in db.q(world, "SELECT DISTINCT title FROM channel_notices")}
+    assert titles & NEAR_MISS_DELAY_TITLES, "缺少近似的延迟类公告"
+    assert titles & NEAR_MISS_FEE_TITLES, "缺少近似的费率类公告"
+
+
+def test_retraction_notice_exists(world):
+    """必须有「当天先发延迟说明、随后把范围收窄到别的渠道」的情形。"""
+    from recon.world.notices import DELAY_TITLES, RETRACTION_TITLES
+    rows = db.q(world, "SELECT channel_id, effective_from FROM channel_notices "
+                       "WHERE title IN (%s)" % ",".join("?" * len(RETRACTION_TITLES)),
+                sorted(RETRACTION_TITLES))
+    assert rows, "缺少更正/收窄公告"
+    for r in rows:
+        titles = _notice_titles(world, r["channel_id"], r["effective_from"])
+        assert titles & DELAY_TITLES, (
+            f"{r['channel_id']}/{r['effective_from']} 有更正公告但没有被它更正的原公告，"
+            f"这个情形就不成立了")
+
+
+def test_d21_inside_window_when_notice_is_scoped(cases, world):
+    """D21 落在部分时段公告的日子上时，交易时刻必须真的在窗内。"""
+    from recon.world.notices import SCOPED_TITLES, WINDOWS, minute_of_day
+    win_by_label = {lab: (lo, hi) for lo, hi, lab in WINDOWS}
+    bad = []
+    for c in _containing(cases, "D21"):
+        d = c["diff"]
+        if not (_notice_titles(world, d["channel_id"], d["bill_date"]) & SCOPED_TITLES):
+            continue
+        body = db.q1(world, """SELECT body FROM channel_notices WHERE channel_id=?
+                               AND effective_from=? AND title IN (%s)"""
+                     % ",".join("?" * len(SCOPED_TITLES)),
+                     [d["channel_id"], d["bill_date"], *sorted(SCOPED_TITLES)])
+        ts = _txn_time(world, d["channel_txn_no"])
+        if not (body and ts):
+            continue
+        lo, hi = next(((a, b) for lab, (a, b) in win_by_label.items() if lab in body["body"]),
+                      (None, None))
+        if lo is None:
+            continue
+        if not (lo <= minute_of_day(ts) < hi):
+            bad.append(f"{d['id']} 标 D21，但交易时刻 {ts[11:16]} 不在公告窗口 "
+                       f"{lo // 60:02d}:00-{hi // 60:02d}:00 内 —— 应判 D01")
+    assert not bad, "D21 落在窗外：\n" + "\n".join(bad[:10])
+
+
+def test_d01_outside_window_or_not_covered(cases, world):
+    """D01 不能落在「整天覆盖」的日子上；若落在部分时段公告的日子上，必须在窗外。"""
+    from recon.world.notices import (DELAY_TITLES, SCOPED_TITLES, WINDOWS,
+                                     minute_of_day)
+    win_by_label = {lab: (lo, hi) for lo, hi, lab in WINDOWS}
+    bad = []
+    for c in _containing(cases, "D01"):
+        d = c["diff"]
+        titles = _notice_titles(world, d["channel_id"], d["bill_date"])
+        if titles & DELAY_TITLES and not (titles & SCOPED_TITLES):
+            # 有整天覆盖的延迟公告 —— 除非当天还有更正公告把本渠道排除掉
+            from recon.world.notices import RETRACTION_TITLES
+            if not (titles & RETRACTION_TITLES):
+                bad.append(f"{d['id']} 标 D01，但当日有整天覆盖的延迟公告，应判 D21")
+            continue
+        if titles & SCOPED_TITLES:
+            body = db.q1(world, """SELECT body FROM channel_notices WHERE channel_id=?
+                                   AND effective_from=? AND title IN (%s)"""
+                         % ",".join("?" * len(SCOPED_TITLES)),
+                         [d["channel_id"], d["bill_date"], *sorted(SCOPED_TITLES)])
+            ts = _txn_time(world, d["channel_txn_no"])
+            if not (body and ts):
+                continue
+            lo, hi = next(((a, b) for lab, (a, b) in win_by_label.items()
+                           if lab in body["body"]), (None, None))
+            if lo is not None and lo <= minute_of_day(ts) < hi:
+                bad.append(f"{d['id']} 标 D01，但交易时刻 {ts[11:16]} 落在公告窗口内，应判 D21")
+    assert not bad, "D01 与 D21 标注互相污染：\n" + "\n".join(bad[:10])
+
+
+def test_every_designed_hard_scenario_has_enough_samples(world):
+    """⭐ 每个设计出来的难点场景都必须有足够样本。
+
+    阶段 5 加了三类难点，整体指标只掉 1 个点，看着像「难点没用」。实际是
+    **两个场景根本没生成出来**：
+
+        部分时段·窗内(应D21)   1 条   ← 时间窗取了 02:00-06:00，那时段几乎没交易
+        近似延迟(应D01)        0 条   ← 那些日期被更正公告污染，全归到别的场景了
+
+    设计了却没生成出来，等于没做 —— 而且它不报错、不让测试变红，
+    只会在报表上多一行 100%，让人以为难点被解决了。这条测试就是防这个。
+    """
+    from recon.eval.scenarios import coverage_report
+    from recon.eval.tasks import load_tasks
+    rows = coverage_report(world, load_tasks(world))
+    bad = [f"{name}: {n} 条 < 要求 {need}" for name, n, need, ok in rows if not ok]
+    detail = "\n".join(f"  {name}: {n} 条（要求 ≥{need}）" for name, n, need, _ in rows)
+    assert not bad, ("有难点场景样本不足，指标会失去分辨力：\n"
+                     + "\n".join(bad) + "\n\n各场景实际条数：\n" + detail)

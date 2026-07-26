@@ -148,24 +148,70 @@ class Injector:
         return bill_date_for(datetime.fromisoformat(row["paid_at"]),
                              CHANNELS[channel_id].cutoff_minutes).isoformat()
 
-    def _covered_on_any_side(self, kind: str, row) -> bool:
-        """公告覆盖判定必须同时看两个日期。
+    def _diff_date(self, row) -> str:
+        """差错最终落在哪个账单日。
 
-        ⚠️ D09/D14 会把渠道记录搬到别的账单日，于是「渠道记录所在的日」和
-           「差错最终落在的日（= 我方记录的账单日）」不再相等。
-           守卫只查前者时，复合差错 (D09,D05) 就会被标成 D05，
-           而它实际落在一个有费率公告的日子上 —— 从可见证据看正确答案是 D22。
-           实测这样产生了 9 条不可解标注。
+        ⚠️ 必须用**我方记录**的账单日，不是渠道记录所在的日。D09/D14 会把渠道记录
+           搬走，两者就不相等 —— 守卫查错一个，就会把 D05 注入到有费率公告的日子上，
+           产出不可解标注（实测 9 条）。复核器读公告读的是差错的 bill_date，以它为准。
         """
-        cover = self.board.fee_cover if kind == "fee" else self.board.delay_cover
-        if not self.board:
-            return False
-        dates = {row["bill_date"]}
         if "pay_id" in row.keys():
             d = self._our_bill_date(row["pay_id"], row["channel_id"])
             if d:
-                dates.add(d)
-        return any((row["channel_id"], d) in cover for d in dates)
+                return d
+        return row["bill_date"]
+
+    def _dates_of(self, row) -> list[str]:
+        """这条候选会让差错落在哪些账单日上。
+
+        ⚠️ 通常只有一个，但 D09/D14 会把两侧记录分到不同日期，于是**同一个逻辑问题
+           在两个账单日各产出一条差错**。两条读到的公告不同，所以守卫必须两侧都查。
+           我先前修过一次这个 bug，后来重构 verdict 时又改回单侧，于是 (D05,D14)
+           又出现了 2 条不可解标注 —— 同一个坑踩了两遍，这次写成显式的日期列表。
+        """
+        out = [row["bill_date"]]
+        if "pay_id" in row.keys():
+            d = self._our_bill_date(row["pay_id"], row["channel_id"])
+            if d and d not in out:
+                out.append(d)
+        return out
+
+    def _delay_one(self, row, d: str) -> str:
+        ch = row["channel_id"]
+        if (ch, d) in self.board.delay_cover:
+            return "covered"
+        if (ch, d) in self.board.near_miss_delay:
+            return "not_covered"
+        if self.board.scoped_window(ch, d):
+            occ = row["occurred_at"] if "occurred_at" in row.keys() else None
+            return "covered" if (occ and self.board.in_scoped_window(ch, d, occ)) \
+                else "not_covered"
+        return "not_covered"
+
+    def _delay_verdict(self, row) -> str:
+        """延迟下发类公告的判定。covered -> D21；not_covered -> D01；skip -> 别在这注入。
+
+        四种情形必须分清，否则两类标注互相污染：
+          整天覆盖             -> covered
+          部分时段覆盖 + 窗内  -> covered
+          部分时段覆盖 + 窗外  -> not_covered   ⭐ 闸门分不开，只能读窗口
+          近似但明确不覆盖     -> not_covered   ⭐ 主题相关，正文要求照常查询
+
+        两个账单日判定不一致时返回 skip —— 那种情形下无论标哪个都会有一条不可解。
+        """
+        if not self.board:
+            return "not_covered"
+        vs = {self._delay_one(row, d) for d in self._dates_of(row)}
+        return vs.pop() if len(vs) == 1 else "skip"
+
+    def _fee_verdict(self, row) -> str:
+        """费率误用类公告的判定。covered -> D22；not_covered -> D05（含近似公告）。"""
+        if not self.board:
+            return "not_covered"
+        ch = row["channel_id"]
+        vs = {("covered" if (ch, d) in self.board.fee_cover else "not_covered")
+              for d in self._dates_of(row)}
+        return vs.pop() if len(vs) == 1 else "skip"
 
     # ------------------------------------------------------------- helpers
     def _group(self) -> str:
@@ -267,7 +313,7 @@ class Injector:
         ⚠️ 该 (渠道,日期) 若被延迟下发公告覆盖，正确答案就是 D21 而不是 D01，
            在这里注入会造成两类标注互相污染。
         """
-        if self._covered_on_any_side("delay", row):
+        if self._delay_verdict(row) != "not_covered":
             return False
         self.conn.execute("DELETE FROM channel_bill_records WHERE id=?", (row["rec_id"],))
         self._record("D01", channel_id=row["channel_id"], bill_date=row["bill_date"],
@@ -342,8 +388,8 @@ class Injector:
     def _d05(self, row, gid: str) -> bool:
         """我方误按协议费率记账 -> 手续费维度差。"""
         # 该 (渠道,日期) 若被费率误用公告覆盖，正确答案是 D22 而不是 D05。
-        # 两侧日期都要查 —— 见 _covered_on_any_side 的说明。
-        if self._covered_on_any_side("fee", row):
+        # 近似公告（跨境附加费/发票规则）不算覆盖 —— 它们明确要求照常冲正。
+        if self._fee_verdict(row) != "not_covered":
             return False
         merchant = MERCHANTS.get(row["merchant_id"])
         override = merchant.fee_override.get(row["channel_id"]) if merchant else None
@@ -664,7 +710,7 @@ class Injector:
         """渠道流水号复用：把另一笔记录的流水号改成本笔的。"""
         # 会连带产出一条 D01（受害方变我方单边）；该日若被延迟下发公告覆盖，
         # 那条应该是 D21 而不是 D01，会污染标注，直接跳过。
-        if self._delay_covered(row["channel_id"], row["bill_date"]):
+        if self._delay_verdict(row) != "not_covered":
             return False
         other = None
         for cand in self._payment_candidates(channels=(row["channel_id"],), limit=30):
@@ -742,8 +788,10 @@ class Injector:
         规则基线读不到公告，必然把它判成 D01 -> CHANNEL_INQUIRY，
         动作错、白开一张查询工单。
         """
-        if not self._delay_covered(row["channel_id"], row["bill_date"]):
+        if self._delay_verdict(row) != "covered":
             return False
+        scoped = (self.board.scoped_window(row["channel_id"], self._diff_date(row))
+                  if self.board else None)
         self.conn.execute("DELETE FROM channel_bill_records WHERE id=?", (row["rec_id"],))
         self._record("D21", channel_id=row["channel_id"], bill_date=row["bill_date"],
                      match_key=row["channel_txn_no"], group_id=gid,
@@ -763,7 +811,7 @@ class Injector:
         规则基线会判 D05 -> REVERSAL，**动一笔本不该动的账**，
         直接打在「错误动账」这个真实损失指标上。
         """
-        if not self._fee_covered(row["channel_id"], row["bill_date"]):
+        if self._fee_verdict(row) != "covered":
             return False
         # 只在 gross 口径渠道注入：net 口径下改手续费会连带改变归一后的 gross，
         # 差错形态就从「仅手续费维度」变成「金额维度」，和 D04 撞车。
@@ -831,8 +879,10 @@ class Injector:
             pool = self._payment_candidates(channels=others, limit=300)
         elif code in ("D21", "D22"):
             # 只能落在被覆盖性公告覆盖的 (渠道, 账单日) 上
-            cover = (self.board.delay_cover if code == "D21" else self.board.fee_cover) \
-                if self.board else set()
+            if not self.board:
+                return False
+            cover = ((self.board.delay_cover | set(self.board.scoped_delay))
+                     if code == "D21" else self.board.fee_cover)
             if not cover:
                 return False
             chans = tuple({c for c, _ in cover})
@@ -866,6 +916,32 @@ class Injector:
                     self.used_txns.add(row["channel_txn_no"])
                     return True
             except Exception:  # 候选不满足前置条件，换下一个
+                continue
+        return False
+
+    def _apply_scoped_d21(self, gid: str) -> bool:
+        """定向注入「部分时段公告 + 交易在窗内」的 D21。
+
+        ⚠️ 不定向的话这个场景会被挤掉：D21 的候选池里「整天覆盖」的日期
+           任何交易都满足条件，而「部分时段」还要求交易落在窗内，
+           按权重随机抽的结果是整天覆盖那批把它挤到只剩 3 条 ——
+           而它恰恰是本阶段最难、最该被测的场景。
+        """
+        if not self.board or not self.board.scoped_delay:
+            return False
+        chans = tuple({c for c, _ in self.board.scoped_delay})
+        pool = [r for r in self._payment_candidates(channels=chans, limit=600)
+                if (r["channel_id"], r["bill_date"]) in self.board.scoped_delay
+                and self.board.in_scoped_window(r["channel_id"], r["bill_date"],
+                                                r["occurred_at"])]
+        for row in pool:
+            if row["channel_txn_no"] in self.used_txns:
+                continue
+            try:
+                if self._d21(row, gid):
+                    self.used_txns.add(row["channel_txn_no"])
+                    return True
+            except Exception:
                 continue
         return False
 
@@ -925,6 +1001,16 @@ class Injector:
                 if self._apply_one(code, self._group()):
                     covered[code] += 1
                     break
+
+        # 1a) 定向保底：部分时段·窗内 是本阶段最难的场景，必须单独凑够样本
+        n_scoped = 12
+        got = 0
+        for _ in range(n_scoped * 8):
+            if got >= n_scoped:
+                break
+            if self._apply_scoped_d21(self._group()):
+                got += 1
+                covered["D21"] += 1
 
         # 1b) D10 的数据变更在这里做，但它由业务规则扫描发现，不由流水匹配发现
         n_d10 = max(3, int(total * 0.03))

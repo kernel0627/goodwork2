@@ -29,6 +29,9 @@ D01→D21 / D05→D22。它**不能凭空造出一个新归因**。
 """
 from __future__ import annotations
 
+import re
+from datetime import datetime
+
 import time
 from dataclasses import dataclass
 
@@ -112,7 +115,57 @@ def _fee_block(facts: dict) -> str:
 """
 
 
-def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict]) -> str:
+_WINDOW_RE = re.compile(r"(\d{1,2}):(\d{2})\s*[-~－—]\s*(\d{1,2}):(\d{2})")
+
+
+def _window_block(task: Task, notices: list[dict], txn_time: str | None) -> str:
+    """⭐ 时间窗归属 —— 确定性判定，不让模型自己比时刻。
+
+    实测这是模型唯一的真短板：整天覆盖的公告它 100% 判对，近似但不覆盖的公告
+    也 100% 没被骗到，但「公告只覆盖某个时间窗」的两个场景一塌糊涂 ——
+    窗内应判 D21 只对 33%，窗外应判 D01 只对 67%。
+
+    它读得懂「有一个时间窗」，做不好「这个时刻是否落在区间内」这种精确比较。
+    而这正是本项目一开始定下的那条线：**模型不做算术，交给确定性代码。**
+    工具层里手续费核算、账单日归属、时间差都是这么处理的，
+    单次复核器手上没工具，所以把结论直接算好摆给它。
+    """
+    if not txn_time:
+        return ""
+    try:
+        t = datetime.fromisoformat(txn_time)
+    except ValueError:
+        return ""
+    mod = t.hour * 60 + t.minute
+    lines = []
+    for n in notices:
+        for m in _WINDOW_RE.finditer(n["body"]):
+            lo = int(m.group(1)) * 60 + int(m.group(2))
+            hi = int(m.group(3)) * 60 + int(m.group(4))
+            if lo >= hi:
+                continue
+            inside = lo <= mod < hi
+            lines.append(
+                f"| {n['id']} | {m.group(0)} | "
+                f"**{'落在窗内' if inside else '不在窗内'}** |")
+    if not lines:
+        return ""
+    return f"""
+# 时间窗归属（确定性判定，直接采用，不要自己比时刻）
+
+本笔交易发生于 **{t:%Y-%m-%d %H:%M}**。下表是它与各公告所提时间窗的关系：
+
+| 公告 | 公告所提时间窗 | 本笔 |
+|---|---|---|
+{chr(10).join(lines)}
+
+⚠️ 一条公告只覆盖某个时间窗时，**只有落在窗内的交易才适用它**；
+窗外的交易应维持规则结论。上表的判定已由代码算好，按它执行。
+"""
+
+
+def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict],
+                 txn_time: str | None = None) -> str:
     codes = "、".join(rule_sol.root_causes) or "（无）"
     acts = "、".join(rule_sol.actions) or "（无）"
     body = "\n\n".join(
@@ -126,7 +179,7 @@ def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict]) -> str:
 
 规则引擎的结论：**{codes}**，拟执行动作 {acts}
 规则的依据：{rule_sol.notes or "（未记录）"}
-{_fee_block(rule_sol.facts)}
+{_fee_block(rule_sol.facts)}{_window_block(task, notices, txn_time)}
 # 该渠道该账单日的全部公告（共 {len(notices)} 条）
 
 {body or "（无）"}
@@ -152,6 +205,22 @@ class ReviewResult:
     error: str = ""
 
 
+def _txn_time(ev: EvidenceView, task: Task) -> str | None:
+    """本笔交易的发生时刻 —— 判断时间窗归属要用。
+
+    渠道侧和我方侧都可能缺（D01 删了渠道记录、D02 我方没记成功），两边都试。
+    """
+    diff = ev.diff(task.diff_id)
+    txn = diff["channel_txn_no"] if diff else None
+    if not txn:
+        return None
+    recs = ev.channel_records_by_txn(txn)
+    if recs:
+        return recs[0]["occurred_at"]
+    p = ev.payment_by_txn(txn)
+    return p["paid_at"] if p and p["paid_at"] else None
+
+
 class NoticeReviewer:
     """单次调用的复核器。给 RouterSolver 当 inner 用。"""
 
@@ -166,10 +235,12 @@ class NoticeReviewer:
     def solve(self, task: Task, ev: EvidenceView, *, prior: Solution) -> Solution:
         before = (ev.reads, ev.rows_read, ev.chars_read)
         notices = ev.channel_notices(task.channel_id, task.bill_date)
+        txn_time = _txn_time(ev, task)
         read_cost = (ev.reads - before[0], ev.rows_read - before[1],
                      ev.chars_read - before[2])
         messages = [{"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": _task_prompt(task, prior, notices)}]
+                    {"role": "user",
+                     "content": _task_prompt(task, prior, notices, txn_time)}]
 
         t0 = time.time()
         try:

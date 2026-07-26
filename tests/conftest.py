@@ -12,7 +12,7 @@ from recon.world.generator import generate
 from recon.world.injector import inject_pre_match
 
 START = "2026-07-01"
-DAYS = 3
+DAYS = 7
 
 
 @pytest.fixture(scope="session")
@@ -21,7 +21,7 @@ def world(tmp_path_factory):
     path = tmp_path_factory.mktemp("recon") / "test.db"
     cfg = GenerateConfig(seed=7, start_date=START, days=DAYS,
                          orders_per_day=150, inject_count_per_day=100)
-    dates = ["2026-07-01", "2026-07-02", "2026-07-03"]
+    dates = [f"2026-07-{d:02d}" for d in range(1, 1 + DAYS)]
     conn = db.init_db(path, reset=True)
     generate(conn, cfg)
     build_bills(conn, START, DAYS, seed=cfg.seed)

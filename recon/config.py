@@ -173,7 +173,10 @@ def required_role(amount_cents: Cents) -> str:
 class GenerateConfig:
     seed: int = 42
     start_date: str = "2026-07-01"
-    days: int = 3
+    # 5 天而不是 3 天：公告层需要足够多互不重叠的 (渠道, 账单日) 位置。
+    # 位置不够时近似类会一条都生成不出来。7 天 × 2 个延迟适用渠道 = 14 个位置，
+    # 够放 整天覆盖 5 + 部分时段 4 + 近似 2，且两个 scoped 子场景各有足够样本。
+    days: int = 7
     orders_per_day: int = 200
     refund_ratio: float = 0.18          # 多少比例的成功订单会产生退款
     partial_refund_ratio: float = 0.45  # 退款里多少是部分退款

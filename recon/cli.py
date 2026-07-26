@@ -58,7 +58,7 @@ def init_db_cmd(reset: bool, db_path: str | None) -> None:
 @cli.command("build")
 @click.option("--seed", default=42, show_default=True)
 @click.option("--start", default="2026-07-01", show_default=True)
-@click.option("--days", default=3, show_default=True)
+@click.option("--days", default=7, show_default=True)
 @click.option("--orders-per-day", default=200, show_default=True)
 @click.option("--inject-per-day", default=120, show_default=True)
 @click.option("--db-path", default=None)

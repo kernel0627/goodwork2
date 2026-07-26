@@ -2,7 +2,7 @@ PY := /Users/traegang/miniforge3/envs/agent/bin/python
 
 SEED   ?= 42
 START  ?= 2026-07-01
-DAYS   ?= 3
+DAYS   ?= 7
 ORDERS ?= 200
 INJECT ?= 120
 

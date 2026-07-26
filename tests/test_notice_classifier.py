@@ -14,7 +14,11 @@ from recon.eval.evidence import EvidenceView
 from recon.eval.tasks import load_tasks
 from recon.router import route_reason
 from recon.world.injector import TEXT_DEPENDENT_CODES
-from recon.world.notices import DELAY_TITLES, FEE_TITLES
+from recon.world.notices import DELAY_TITLES, FEE_TITLES, SCOPED_TITLES
+
+# 部分时段公告也属于延迟覆盖类（只是只覆盖窗内交易）。
+# 假分类器必须认识它，否则 typed 闸门会把窗内的 D21 当干扰漏放掉。
+DELAY_LIKE = DELAY_TITLES | SCOPED_TITLES
 
 
 class _Boom:
@@ -28,7 +32,7 @@ def _oracle(conn) -> dict[str, str]:
     """按标题给出真标签。只有测试能这么做 —— 求解方不许看标题走捷径。"""
     out = {}
     for r in db.q(conn, "SELECT id, title FROM channel_notices"):
-        out[r["id"]] = (nc.DELAY if r["title"] in DELAY_TITLES
+        out[r["id"]] = (nc.DELAY if r["title"] in DELAY_LIKE
                         else nc.FEE if r["title"] in FEE_TITLES else nc.NONE)
     return out
 
@@ -41,7 +45,7 @@ class _Oracle:
         self.by_title = {}
         for r in db.q(conn, "SELECT title FROM channel_notices"):
             t = r["title"]
-            self.by_title[t] = (nc.DELAY if t in DELAY_TITLES
+            self.by_title[t] = (nc.DELAY if t in DELAY_LIKE
                                 else nc.FEE if t in FEE_TITLES else nc.NONE)
         self.calls = 0
 
@@ -139,10 +143,23 @@ def test_typed_gate_leaks_when_a_covering_notice_is_mislabelled(world):
     any 闸门没有这个风险 —— 这是 typed 用成本换来的代价，必须被看见。
     """
     labels = nc.classify_all(world, _Oracle(world), use_cache=False)
+
+    # 必须毒化一条**真的承载着 D22 任务**的公告。
+    # 原来是「取第一条 FEE 公告」，但有些费率公告所在的 (渠道,日期) 上并没有
+    # D22 任务，毒化它自然不会造成漏放 —— 那样这条测试就形同虚设。
+    d22_dates = {(t.channel_id, t.bill_date) for t in load_tasks(world)
+                 if "D22" in t.gold_codes}
+    target = None
     for nid, v in labels.items():
-        if v["label"] == nc.FEE:
-            v["label"] = nc.NONE          # 只毒化一条
+        if v["label"] != nc.FEE:
+            continue
+        row = db.q1(world, "SELECT channel_id, effective_from FROM channel_notices WHERE id=?",
+                    (nid,))
+        if row and (row["channel_id"], row["effective_from"]) in d22_dates:
+            target = nid
             break
+    assert target, "没有任何费率公告承载 D22 任务，世界构造有问题"
+    labels[target]["label"] = nc.NONE          # 只毒化这一条
     covering = nc.covering_dates(world, labels)
 
     ev = EvidenceView(world)
