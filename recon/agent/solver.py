@@ -113,6 +113,10 @@ def persist_runs(conn, results: list[RunResult], *, solver: str) -> int:
                 "tokens_in": st.tokens_in, "tokens_out": st.tokens_out,
                 "latency_ms": st.latency_ms,
             })
+    # ⚠️ 这两张表是**工作表**（只反映最近一次运行，供 replay 用），
+    #    历史归档在 recon/archive.py 的独立数据库里，只追加、永不删除。
+    #    原来只有这两张表，于是「删掉再写」+ build --reset 叠加起来，
+    #    跑了几十轮实验一条轨迹都没留下。
     conn.execute("DELETE FROM agent_steps")
     conn.execute("DELETE FROM agent_runs")
     db.insert_many(conn, "agent_runs", runs)

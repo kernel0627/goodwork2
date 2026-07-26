@@ -12,7 +12,8 @@ ORDERS ?= 200
 INJECT ?= 120
 
 .PHONY: help build test check stats report case case-composite repro clean all \
-        tasks baseline agent replay variance ablate route scenarios
+        tasks baseline agent replay variance ablate route scenarios \
+        archive-stats archive-export holdout-build holdout-check holdout-eval
 
 help:
 	@echo "make build            生成完整业务世界 + 带答案的差错池（一条命令）"
@@ -31,6 +32,9 @@ help:
 	@echo "make variance         同配置重复跑，量方差与 pass^k"
 	@echo "make ablate           消融阶梯"
 	@echo "make repro            验证同 seed 可复现"
+	@echo "make holdout-build    构建并封存阶段 6 holdout（不调用模型）"
+	@echo "make holdout-check    核验 holdout 未被改动及一次性评测状态"
+	@echo "make holdout-eval     一次性正式评测（需 CONFIRM_HOLDOUT=yes）"
 	@echo "make all              build + test + report"
 	@echo ""
 	@echo "参数：SEED=$(SEED) START=$(START) DAYS=$(DAYS) ORDERS=$(ORDERS) INJECT=$(INJECT)"
@@ -90,8 +94,38 @@ route-dry:
 repro:
 	$(PY) -m recon.cli verify-repro
 
+# ---- 轨迹归档（只追加，跨世界重建存活）----
+archive-stats:
+	$(PY) -m recon.cli archive-stats
+
+archive-export:
+	$(PY) -m recon.cli archive-export --out data/sft.jsonl
+
+# ---- 阶段 6 holdout（正式评测只能启动一次）----
+holdout-build:
+	$(PY) -m recon.cli holdout-build
+
+holdout-check:
+	$(PY) -m recon.cli holdout-check
+
+holdout-eval:
+	@if [ "$(CONFIRM_HOLDOUT)" != "yes" ]; then \
+		echo "拒绝启动：这是一次性正式评测。确认后使用 CONFIRM_HOLDOUT=yes make holdout-eval"; \
+		exit 2; \
+	fi
+	$(PY) -m recon.cli holdout-eval --confirm-once --workers $(AGENT_WORKERS)
+
 all: build test report baseline
 
+# ⚠️ 原来这里是 `rm -rf data`，会把 data/archive.db 一起删掉 ——
+#    那是几十轮实验积累的轨迹，删了不可恢复，而世界库随时能重建。
+#    所以只删可重建的东西；要删归档必须手动，见 clean-archive。
 clean:
-	rm -rf data __pycache__ .pytest_cache
+	rm -f data/recon.db data/recon.db-wal data/recon.db-shm
+	rm -rf __pycache__ .pytest_cache
 	find . -name '__pycache__' -type d -exec rm -rf {} +
+	@echo "已清理世界库与缓存。data/archive.db 保留（轨迹归档，不可重建）。"
+
+clean-archive:
+	@echo "这会永久删除 data/archive.db —— 所有历史轨迹，不可恢复。"
+	@echo "确认请手动执行： rm -f data/archive.db*"

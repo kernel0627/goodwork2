@@ -32,13 +32,14 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+import json
 import time
 from dataclasses import dataclass
 
 from ..eval.evidence import EvidenceView
 from ..eval.solution import Solution
 from ..eval.tasks import Task
-from ..world.injector import CODES, HOLD_NEXT_BILL
+from ..world.injector import CODES
 from .llm import LLMClient, LLMError, LLMFatalError
 
 # 复核只允许做这一种改判 —— 与 router.TEXT_OVERRIDABLE 同源，见 diff_sop.md
@@ -142,9 +143,10 @@ def _window_block(task: Task, notices: list[dict], txn_time: str | None) -> str:
         for m in _WINDOW_RE.finditer(n["body"]):
             lo = int(m.group(1)) * 60 + int(m.group(2))
             hi = int(m.group(3)) * 60 + int(m.group(4))
-            if lo >= hi:
+            if lo == hi:
                 continue
-            inside = lo <= mod < hi
+            inside = (lo <= mod < hi if lo < hi
+                      else mod >= lo or mod < hi)
             lines.append(
                 f"| {n['id']} | {m.group(0)} | "
                 f"**{'落在窗内' if inside else '不在窗内'}** |")
@@ -164,8 +166,46 @@ def _window_block(task: Task, notices: list[dict], txn_time: str | None) -> str:
 """
 
 
+_AMOUNT_RANGE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*元(?:（含）|\(含\))?\s*"
+    r"(?:至|到|[-~－—])\s*"
+    r"(\d+(?:\.\d+)?)\s*元(?:（含）|\(含\))?")
+
+
+def _amount_block(notices: list[dict], amount_cents: int | None) -> str:
+    """把公告金额边界做确定性比较，模型只判断文字规则是否适用。"""
+    if amount_cents is None:
+        return ""
+    amount = abs(amount_cents)
+    lines = []
+    for notice in notices:
+        for match in _AMOUNT_RANGE_RE.finditer(notice["body"]):
+            lo = int(round(float(match.group(1)) * 100))
+            hi = int(round(float(match.group(2)) * 100))
+            if lo > hi:
+                continue
+            inside = lo <= amount <= hi
+            lines.append(
+                f"| {notice['id']} | {lo / 100:.2f}~{hi / 100:.2f} 元 | "
+                f"**{'落在区间内' if inside else '不在区间内'}** |")
+    if not lines:
+        return ""
+    return f"""
+# 金额范围归属（确定性判定，直接采用）
+
+本笔交易金额为 **{amount / 100:.2f} 元**。
+
+| 公告 | 公告金额范围 | 本笔 |
+|---|---:|---|
+{chr(10).join(lines)}
+
+公告后续只保留某个金额范围时，区间外项目应以更正后的范围为准。
+"""
+
+
 def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict],
-                 txn_time: str | None = None) -> str:
+                 txn_time: str | None = None,
+                 txn_amount_cents: int | None = None) -> str:
     codes = "、".join(rule_sol.root_causes) or "（无）"
     acts = "、".join(rule_sol.actions) or "（无）"
     body = "\n\n".join(
@@ -179,7 +219,7 @@ def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict],
 
 规则引擎的结论：**{codes}**，拟执行动作 {acts}
 规则的依据：{rule_sol.notes or "（未记录）"}
-{_fee_block(rule_sol.facts)}{_window_block(task, notices, txn_time)}
+{_fee_block(rule_sol.facts)}{_window_block(task, notices, txn_time)}{_amount_block(notices, txn_amount_cents)}
 # 该渠道该账单日的全部公告（共 {len(notices)} 条）
 
 {body or "（无）"}
@@ -193,10 +233,20 @@ def _task_prompt(task: Task, rule_sol: Solution, notices: list[dict],
 
 @dataclass
 class ReviewResult:
+    """一次复核的完整记录。
+
+    ⚠️ messages / raw_response 是**必须**存的：没有它们，这条轨迹永远变不成
+       训练样本 —— 而复核器是单次调用、输入闭合、旁边就有答案，
+       是整个项目里最适合做 SFT 的数据。原来一条都没存下来。
+    """
     task_id: str
     overridden: bool
     notice_id: str | None
     reasoning: str
+    messages: list | None = None      # 原样发出去的 messages（不含答案）
+    raw_response: str | None = None   # 模型原样返回的内容
+    parsed_ok: bool = True
+    diff_id: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
     cached_in: int = 0
@@ -218,7 +268,17 @@ def _txn_time(ev: EvidenceView, task: Task) -> str | None:
     if recs:
         return recs[0]["occurred_at"]
     p = ev.payment_by_txn(txn)
-    return p["paid_at"] if p and p["paid_at"] else None
+    if p and p["paid_at"]:
+        return p["paid_at"]
+    r = ev.refund_by_txn(txn)
+    return r["refunded_at"] if r and r["refunded_at"] else None
+
+
+def _txn_amount(ev: EvidenceView, task: Task) -> int | None:
+    diff = ev.diff(task.diff_id)
+    if not diff or diff["our_gross_cents"] is None:
+        return None
+    return abs(int(diff["our_gross_cents"]))
 
 
 class NoticeReviewer:
@@ -237,13 +297,16 @@ class NoticeReviewer:
         notices = ev.channel_notices(task.channel_id, task.bill_date,
                                      as_of=task.as_of or None)
         txn_time = _txn_time(ev, task)
+        txn_amount = _txn_amount(ev, task)
         read_cost = (ev.reads - before[0], ev.rows_read - before[1],
                      ev.chars_read - before[2])
         messages = [{"role": "system", "content": SYSTEM},
                     {"role": "user",
-                     "content": _task_prompt(task, prior, notices, txn_time)}]
+                     "content": _task_prompt(
+                         task, prior, notices, txn_time, txn_amount)}]
 
         t0 = time.time()
+        snapshot = [dict(m) for m in messages]      # 存一份快照，后续不受修改影响
         try:
             data, usage = self.llm.complete_json(messages, max_tokens=1500)
         except LLMFatalError:
@@ -254,6 +317,8 @@ class NoticeReviewer:
         except LLMError as e:
             self.results.append(ReviewResult(
                 task.task_id, False, None, f"复核调用失败：{e}",
+                messages=snapshot, raw_response=None, parsed_ok=False,
+                diff_id=task.diff_id,
                 latency_ms=int((time.time() - t0) * 1000), error=str(e)))
             return safe_review_failure(prior, str(e))
 
@@ -264,6 +329,9 @@ class NoticeReviewer:
             #    时，非空字符串在 Python 里是 True —— 会把「没覆盖」读成「覆盖」。
             self.results.append(ReviewResult(
                 task.task_id, False, None, f"复核输出不合法：{why}",
+                messages=snapshot,
+                raw_response=json.dumps(data, ensure_ascii=False, default=str),
+                parsed_ok=False, diff_id=task.diff_id,
                 latency_ms=int((time.time() - t0) * 1000), error=why))
             return safe_review_failure(prior, why)
         reasoning = str(data.get("reasoning") or "")[:500]
@@ -276,7 +344,10 @@ class NoticeReviewer:
 
         self.results.append(ReviewResult(
             task.task_id, applied, data.get("notice_id") if applied else None,
-            reasoning, tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
+            reasoning, messages=snapshot,
+            raw_response=json.dumps(data, ensure_ascii=False, default=str),
+            parsed_ok=True, diff_id=task.diff_id,
+            tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
             cached_in=usage.cached_in, cost_micro_cny=usage.cost_micro_cny,
             latency_ms=usage.latency_ms))
 

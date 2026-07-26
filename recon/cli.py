@@ -516,9 +516,12 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
               show_default=True,
               help="any=当日有任何公告就路由（零模型）；typed=先给公告分类，只在类型对得上时路由")
 @click.option("--save/--no-save", default=True)
+@click.option("--report-stem", default=None, hidden=True)
+@click.option("--archive-results/--no-archive-results", default=True, hidden=True)
 def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
               model: str | None, dry_run: bool, mode: str, gate: str,
-              save: bool) -> None:
+              save: bool, report_stem: str | None,
+              archive_results: bool) -> None:
     """规则优先路由 —— 规则先跑，只把它注定读不到的那部分交给模型。
 
     --dry-run 只跑闸门：路由比例、需读文本召回、放行部分正确率，全部零 token。
@@ -537,6 +540,7 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
     from .eval.tasks import default_ensure, load_tasks, sample_tasks
     from .router import RouterSolver, route_summary, run_router
     from .world.injector import TEXT_DEPENDENT_CODES
+    from . import archive
 
     conn = db.connect(db_path)
     every = load_tasks(conn)
@@ -599,12 +603,14 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
                   f"只跑被路由的 {s['routed']} 条")
 
     stats = None
+    review_results = None
     if mode == "review":
         def inner_run(batch, priors):
-            nonlocal stats
+            nonlocal stats, review_results
             sols_, results = run_review(db_path, batch, priors,
                                         llm=client, workers=workers)
             stats = review_stats(results)
+            review_results = results
             return sols_
         merge = False           # 复核方自己累加成本
     else:
@@ -615,6 +621,18 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
 
     sols, _ = run_router(db_path, tasks, inner_run=inner_run, merge=merge,
                          covering=covering)
+
+    # ---- 归档：跑一次就留一次痕迹，只追加，世界重建也不会丢 ----
+    if review_results is not None and archive_results:
+        n_arch = _archive_reviews(conn, archive, tasks, review_results, sols,
+                                  command="route", solver=f"router-{mode}-{gate}",
+                                  model=client.name,
+                                  config={"mode": mode, "gate": gate,
+                                          "workers": workers,
+                                          "all_tasks": all_tasks,
+                                          "limit": None if all_tasks else limit})
+        console.print(f"[green]已归档[/] {n_arch} 条轨迹 → {archive.ARCHIVE_PATH.name}"
+                      f"（只追加；`make archive-stats` 看累计）")
 
     if stats:
         console.print(f"复核 {stats['reviewed']} 条：改判 [cyan]{stats['overridden']}[/]、"
@@ -627,10 +645,200 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
     console.rule("[bold]规则基线 vs 规则优先路由[/]")
     rp.print_comparison(reps)
     if save:
-        p = DOCS / f"stage4_router_{mode}_{gate}.md"
+        p = DOCS / f"{report_stem or f'stage4_router_{mode}_{gate}'}.md"
         p.write_text(rp.comparison_markdown(reps, tasks=tasks), encoding="utf-8")
         console.print(f"[green]已写入[/] {p}")
     conn.close()
+
+
+@cli.command("holdout-build")
+def holdout_build_cmd() -> None:
+    """构建并封存阶段 6 holdout；不调用模型。"""
+    from tempfile import TemporaryDirectory
+
+    from .holdout import (HOLDOUT_DB, HOLDOUT_SEAL, build_world, create_seal,
+                          verify_seal)
+
+    existing = [p for p in (HOLDOUT_DB, HOLDOUT_SEAL) if p.exists()]
+    if existing:
+        names = "、".join(str(p) for p in existing)
+        raise click.ClickException(
+            f"正式 holdout 已存在：{names}。为防止覆盖或挑结果，命令拒绝重建。")
+
+    HOLDOUT_DB.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="holdout-build-", dir=HOLDOUT_DB.parent) as td:
+        tmp_root = Path(td)
+        tmp_db = tmp_root / HOLDOUT_DB.name
+        tmp_seal = tmp_root / HOLDOUT_SEAL.name
+        summary = build_world(tmp_db)
+        create_seal(tmp_db, tmp_seal)
+        tmp_db.replace(HOLDOUT_DB)
+        tmp_seal.replace(HOLDOUT_SEAL)
+
+    seal = verify_seal()
+    console.print("[green]holdout 已构建并封存；未调用模型。[/]")
+    console.print(f"版本：{seal['version']}")
+    console.print(f"任务：{summary['tasks']}，需读文本：{summary['text_dependent']}，"
+                  f"公告：{summary['notices']}，场景：{summary['scenarios']}")
+    console.print(f"世界指纹：{seal['world_fingerprint']}")
+    console.print(f"评测器指纹：{seal['evaluator_fingerprint']}")
+
+
+@cli.command("holdout-check")
+def holdout_check_cmd() -> None:
+    """核验正式 holdout 的数据、语料、评测器和一次性状态。"""
+    from .holdout import verify_seal
+
+    seal = verify_seal()
+    summary = seal["summary"]
+    evaluation = seal["evaluation"]
+    console.print("[green]holdout seal 校验通过。[/]")
+    console.print(f"版本：{seal['version']}，状态：{evaluation['status']}")
+    console.print(f"任务：{summary['tasks']}，需读文本：{summary['text_dependent']}，"
+                  f"公告：{summary['notices']}，场景：{summary['scenarios']}")
+
+
+@cli.command("holdout-eval")
+@click.option("--confirm-once", is_flag=True,
+              help="确认开始一次性正式评测；运行、失败或完成后均拒绝重跑")
+@click.option("--workers", default=12, show_default=True)
+@click.option("--model", default=None)
+def holdout_eval_cmd(confirm_once: bool, workers: int, model: str | None) -> None:
+    """一次性正式评测。结果不进入训练轨迹归档，避免 holdout 答案泄漏。"""
+    from .agent.llm import DeepSeekClient
+    from .holdout import (HOLDOUT_DB, HOLDOUT_SEAL, set_evaluation_state,
+                          verify_seal)
+
+    if not confirm_once:
+        raise click.ClickException(
+            "这是一次性正式评测。准备好密钥、模型和网络后，显式加 --confirm-once。")
+
+    seal = verify_seal()
+    status = seal["evaluation"]["status"]
+    if status != "sealed":
+        raise click.ClickException(
+            f"holdout 状态为 {status!r}，一次性评测已经启动过，拒绝重跑。")
+
+    # 只做本地客户端预检，不读取 holdout、不发网络请求。配置错误不消耗一次机会。
+    try:
+        DeepSeekClient(model=model)
+    except Exception as exc:
+        raise click.ClickException(f"模型客户端预检失败，正式评测尚未开始：{exc}") from exc
+
+    report = DOCS / "stage6_holdout_v1.md"
+    set_evaluation_state("running", seal_path=HOLDOUT_SEAL)
+    try:
+        route_cmd.callback(  # type: ignore[union-attr]
+            db_path=str(HOLDOUT_DB), limit=60, all_tasks=True,
+            workers=workers, model=model, dry_run=False, mode="review",
+            gate="any", save=True, report_stem=report.stem,
+            archive_results=False)
+    except Exception as exc:
+        set_evaluation_state(
+            "failed", error=f"{type(exc).__name__}: {exc}",
+            seal_path=HOLDOUT_SEAL)
+        raise
+    set_evaluation_state(
+        "complete", report=str(report.relative_to(db.PROJECT_ROOT)),
+        seal_path=HOLDOUT_SEAL)
+    console.print("[green]一次性正式评测完成。[/]")
+
+
+def _archive_reviews(conn, archive, tasks, results, sols, *, command: str,
+                     solver: str, model: str, config: dict) -> int:
+    """把一批复核轨迹落到归档库。
+
+    ⚠️ 输入侧（messages）和答案侧（gold_*）分两组字段写，绝不拼在一起 ——
+       混着存一次，整批数据在训练时就废了。
+    """
+    from .eval.grader import grade_one
+    from .eval.scenarios import ScenarioView
+
+    by_id = {t.task_id: t for t in tasks}
+    sv = ScenarioView(conn)
+    with archive.Recorder(command=command, solver=solver, model=model,
+                          config=config, world_conn=conn) as rec:
+        for r in results:
+            t = by_id.get(r.task_id)
+            if t is None:
+                continue
+            sol = sols.get(r.task_id)
+            g = grade_one(t, sol) if sol is not None else None
+            rec.record(
+                task_id=r.task_id, diff_id=r.diff_id or t.diff_id, kind="review",
+                messages=r.messages, raw_response=r.raw_response,
+                parsed_ok=r.parsed_ok, parse_error=r.error or "",
+                pred_codes=list(sol.root_causes) if sol else None,
+                pred_actions=list(sol.actions) if sol else None,
+                pred_status=sol.expected_status if sol else None,
+                confidence=sol.confidence if sol else None,
+                gold_codes=list(t.gold_codes), gold_actions=list(t.gold_actions),
+                gold_status=t.gold_status,
+                scenario=sv.classify(t),
+                attr_exact=g.attr_exact if g else None,
+                action_exact=g.action_exact if g else None,
+                wrong_money=g.wrong_money_action if g else None,
+                tokens_in=r.tokens_in, tokens_out=r.tokens_out,
+                cached_in=r.cached_in, latency_ms=r.latency_ms, error=r.error or "")
+        return rec._n
+
+
+@cli.command("archive-stats")
+@click.option("--archive-path", default=None)
+def archive_stats_cmd(archive_path: str | None) -> None:
+    """归档里累计存了多少轨迹 —— 想训练时先看这个。"""
+    from . import archive
+    st = archive.stats(archive_path)
+    if not st["trajectories"]:
+        console.print("[yellow]归档是空的[/]。跑一次 `make route` 就会开始积累。")
+        return
+    tb = Table(title="轨迹归档（只追加）", show_header=False)
+    tb.add_row("实验运行", str(st["runs"]))
+    tb.add_row("轨迹条数", f"[bold]{st['trajectories']}[/]")
+    tb.add_row("覆盖任务", str(st["tasks_covered"]))
+    tb.add_row("可用于 SFT（有输入+有答案）", f"{min(st['with_messages'], st['with_gold'])}")
+    tb.add_row("其中判对 / 判错", f"{st['correct']} / {st['wrong']}")
+    tb.add_row("错误动账样本", f"{st['wrong_money']}  ← 拒绝动账的负样本，很值钱")
+    tb.add_row("累计 token", f"入 {st['tokens_in']:,} / 出 {st['tokens_out']:,}")
+    console.print(tb)
+    for title, d in (("按类型", st["by_kind"]), ("按场景", st["by_scenario"])):
+        if d:
+            console.print(f"\n[bold]{title}[/]")
+            for k, v in d.items():
+                console.print(f"    {v:>5}  {k}")
+    if len(st["by_world"]) > 1 or len(st["by_code_rev"]) > 1:
+        console.print(f"\n[yellow]注意[/] 归档里有 {len(st['by_world'])} 个不同的世界指纹、"
+                      f"{len(st['by_code_rev'])} 个代码版本。"
+                      f"\n训练前**按指纹和版本筛**，不同实验条件的轨迹混在一起训会互相污染。")
+        for k, v in st["by_code_rev"].items():
+            console.print(f"    {v:>5} run  code_rev={k}")
+
+
+@cli.command("archive-export")
+@click.option("--out", "out_path", default="data/sft.jsonl", show_default=True)
+@click.option("--archive-path", default=None)
+@click.option("--kind", default="review", show_default=True)
+@click.option("--only-correct/--all", default=None,
+              help="只导判对的（默认全导 —— 判错的样本对训练同样有用）")
+@click.option("--world", default=None, help="只导某个世界指纹的（强烈建议指定）")
+def archive_export_cmd(out_path: str, archive_path: str | None, kind: str,
+                       only_correct: bool | None, world: str | None) -> None:
+    """导出成 SFT 用的 JSONL。
+
+    每行 = {messages（干净输入）, response（模型原样输出）, label（答案+判分）, meta（溯源）}。
+
+    ⚠️ 划分训练/测试要**按公告模板**，不是按任务随机 —— 当前 1192 条任务只共享
+       25 条公告，随机划分会让同一条公告同时出现在训练和测试集，那是泄漏。
+       详见 docs/training_deferred.md。
+    """
+    from . import archive
+    n = archive.export_sft(out_path, path=archive_path, kind=kind,
+                           only_correct=only_correct,
+                           world_fingerprint_filter=world)
+    console.print(f"[green]导出 {n} 条[/] → {out_path}")
+    if n and world is None:
+        console.print("[yellow]提示[/] 没有按 --world 筛。如果归档里有多个世界指纹，"
+                      "这批数据是混的。先跑 `archive-stats` 确认。")
 
 
 @cli.command("variance")

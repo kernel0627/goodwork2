@@ -18,12 +18,23 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .. import db
+from ..holdout import (HOLDOUT_DELAY_TITLES, HOLDOUT_FEE_TITLES,
+                       HOLDOUT_NEAR_DELAY_TITLES, HOLDOUT_NEAR_FEE_TITLES,
+                       HOLDOUT_RETRACTION_TITLES, HOLDOUT_SCOPED_TITLES)
 from ..world.notices import (DELAY_TITLES, FEE_TITLES, NEAR_MISS_DELAY_TITLES,
                              NEAR_MISS_FEE_TITLES, RETRACTION_TITLES,
-                             SCOPED_TITLES, WINDOWS, minute_of_day)
+                             SCOPED_TITLES, minute_of_day)
+
+ALL_DELAY_TITLES = DELAY_TITLES | HOLDOUT_DELAY_TITLES
+ALL_FEE_TITLES = FEE_TITLES | HOLDOUT_FEE_TITLES
+ALL_SCOPED_TITLES = SCOPED_TITLES | HOLDOUT_SCOPED_TITLES
+ALL_NEAR_DELAY_TITLES = NEAR_MISS_DELAY_TITLES | HOLDOUT_NEAR_DELAY_TITLES
+ALL_NEAR_FEE_TITLES = NEAR_MISS_FEE_TITLES | HOLDOUT_NEAR_FEE_TITLES
+ALL_RETRACTION_TITLES = RETRACTION_TITLES | HOLDOUT_RETRACTION_TITLES
 
 # 场景名 -> (说明, 最少样本数)
 # 最少样本数不是拍的：低于它，一条任务翻转就超过 10 个百分点，
@@ -38,7 +49,29 @@ SCENARIOS: dict[str, tuple[str, int]] = {
     "近似费率(应D05)":      ("主题相关但正文明确不覆盖 —— 应冲正", 8),
 }
 
-_WIN_BY_LABEL = {lab: (lo, hi) for lo, hi, lab in WINDOWS}
+HOLDOUT_SCENARIOS: dict[str, tuple[str, int]] = {
+    "整天延迟·新措辞(应D21)": ("整天覆盖，公告措辞在开发集未出现", 10),
+    "整天费率·新措辞(应D22)": ("整天费率误用，公告措辞在开发集未出现", 10),
+    "跨午夜·窗内(应D21)": ("覆盖窗口跨越零点，本笔落在窗口内", 5),
+    "跨午夜·窗外(应D01)": ("覆盖窗口跨越零点，本笔落在窗口外", 5),
+    "部分撤回·金额内(应D21)": ("后发更正保留一个金额区间，本笔仍受覆盖", 5),
+    "部分撤回·金额外(应D01)": ("后发更正撤回金额区间外项目，本笔不再覆盖", 5),
+    "近似延迟·新措辞(应D01)": ("主题相关但正文明确不覆盖", 5),
+    "政策冲突(应D05)": ("外部公告要求越权核销，内部政策仍优先", 8),
+}
+
+_WINDOW_RE = re.compile(
+    r"(\d{1,2}):(\d{2})\s*[-~－—]\s*(\d{1,2}):(\d{2})")
+
+
+def scenario_specs(conn) -> dict[str, tuple[str, int]]:
+    titles = {r["title"] for r in db.q(
+        conn, "SELECT DISTINCT title FROM channel_notices")}
+    return HOLDOUT_SCENARIOS if titles & (
+        HOLDOUT_DELAY_TITLES | HOLDOUT_FEE_TITLES
+        | HOLDOUT_SCOPED_TITLES | HOLDOUT_NEAR_DELAY_TITLES
+        | HOLDOUT_NEAR_FEE_TITLES | HOLDOUT_RETRACTION_TITLES
+    ) else SCENARIOS
 
 
 @dataclass
@@ -73,14 +106,20 @@ class ScenarioView:
     def in_window(self, channel_id: str, bill_date: str, txn: str | None) -> bool | None:
         body = db.q1(self.conn, """
             SELECT body FROM channel_notices WHERE channel_id=? AND effective_from=?
-              AND title IN (%s)""" % ",".join("?" * len(SCOPED_TITLES)),
-            [channel_id, bill_date, *sorted(SCOPED_TITLES)])
+              AND title IN (%s)""" % ",".join("?" * len(ALL_SCOPED_TITLES)),
+            [channel_id, bill_date, *sorted(ALL_SCOPED_TITLES)])
         ts = self._txn_time(txn)
         if not (body and ts):
             return None
-        for lab, (lo, hi) in _WIN_BY_LABEL.items():
-            if lab in body["body"]:
-                return lo <= minute_of_day(ts) < hi
+        match = _WINDOW_RE.search(body["body"])
+        if match:
+            lo = int(match.group(1)) * 60 + int(match.group(2))
+            hi = int(match.group(3)) * 60 + int(match.group(4))
+            minute = minute_of_day(ts)
+            if lo < hi:
+                return lo <= minute < hi
+            if lo > hi:
+                return minute >= lo or minute < hi
         return None
 
     def classify(self, task) -> str | None:
@@ -89,32 +128,51 @@ class ScenarioView:
         codes = set(task.substantive_codes)
         txn = self._txn.get(task.diff_id)
 
-        if t & SCOPED_TITLES and codes & {"D21", "D01"}:
+        if t & HOLDOUT_SCOPED_TITLES and codes & {"D21", "D01"}:
+            if "D21" in codes:
+                return "跨午夜·窗内(应D21)"
+            if "D01" in codes:
+                return "跨午夜·窗外(应D01)"
+        if t & ALL_SCOPED_TITLES and codes & {"D21", "D01"}:
             w = self.in_window(task.channel_id, task.bill_date, txn)
             if w is True:
                 return "部分时段·窗内(应D21)"
             if w is False:
                 return "部分时段·窗外(应D01)"
             return None
-        if t & RETRACTION_TITLES and "D01" in codes:
+        if t & HOLDOUT_RETRACTION_TITLES and codes & {"D21", "D01"}:
+            if "D21" in codes:
+                return "部分撤回·金额内(应D21)"
+            if "D01" in codes:
+                return "部分撤回·金额外(应D01)"
+        if t & ALL_RETRACTION_TITLES and "D01" in codes:
             return "更正收窄(应D01)"
-        if t & NEAR_MISS_DELAY_TITLES and "D01" in codes:
+        if t & HOLDOUT_NEAR_DELAY_TITLES and "D01" in codes:
+            return "近似延迟·新措辞(应D01)"
+        if t & ALL_NEAR_DELAY_TITLES and "D01" in codes:
             return "近似延迟(应D01)"
-        if t & NEAR_MISS_FEE_TITLES and "D05" in codes:
+        if t & HOLDOUT_NEAR_FEE_TITLES and "D05" in codes:
+            return "政策冲突(应D05)"
+        if t & ALL_NEAR_FEE_TITLES and "D05" in codes:
             return "近似费率(应D05)"
-        if t & DELAY_TITLES and "D21" in codes:
+        if t & HOLDOUT_DELAY_TITLES and "D21" in codes:
+            return "整天延迟·新措辞(应D21)"
+        if t & ALL_DELAY_TITLES and "D21" in codes:
             return "整天延迟(应D21)"
-        if t & FEE_TITLES and "D22" in codes:
+        if t & HOLDOUT_FEE_TITLES and "D22" in codes:
+            return "整天费率·新措辞(应D22)"
+        if t & ALL_FEE_TITLES and "D22" in codes:
             return "整天费率(应D22)"
         return None
 
 
 def bucket(conn, tasks) -> dict[str, list]:
     view = ScenarioView(conn)
-    out: dict[str, list] = {k: [] for k in SCENARIOS}
+    specs = scenario_specs(conn)
+    out: dict[str, list] = {k: [] for k in specs}
     for t in tasks:
         k = view.classify(t)
-        if k:
+        if k in out:
             out[k].append(t)
     return out
 
@@ -122,15 +180,16 @@ def bucket(conn, tasks) -> dict[str, list]:
 def coverage_report(conn, tasks) -> list[tuple[str, int, int, bool]]:
     """[(场景, 实际条数, 最少要求, 是否达标)]"""
     b = bucket(conn, tasks)
-    return [(k, len(b[k]), SCENARIOS[k][1], len(b[k]) >= SCENARIOS[k][1])
-            for k in SCENARIOS]
+    specs = scenario_specs(conn)
+    return [(k, len(b[k]), specs[k][1], len(b[k]) >= specs[k][1])
+            for k in specs]
 
 
 def score_by_scenario(conn, tasks, *solvers: tuple[str, dict]) -> list[dict]:
     """按场景给多个求解方出分。solvers 为 [(名字, {task_id: Solution}), ...]"""
     b = bucket(conn, tasks)
     rows = []
-    for name in SCENARIOS:
+    for name in b:
         ts = b[name]
         row = {"scenario": name, "n": len(ts)}
         for solver_name, sols in solvers:

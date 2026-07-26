@@ -1,4 +1,6 @@
 data/
+# 归档是长期资产，但可能很大；不提交，务必自己备份。
+# ⚠️ 不要对 data/ 做 rm -rf —— archive.db 在里面，删了不可恢复。
 __pycache__/
 *.pyc
 .pytest_cache/
