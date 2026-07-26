@@ -16,7 +16,7 @@ from ..eval.evidence import EvidenceView
 from ..eval.solution import Solution
 from ..eval.tasks import Task
 from .config import AgentConfig, V1
-from .llm import DeepSeekClient, LLMClient, LLMFatalError
+from .llm import LLMClient, LLMFatalError, OpenAICompatibleClient
 from .loop import AgentRunner, RunResult
 
 
@@ -46,7 +46,7 @@ def run_agent(db_path: str | Path | None, tasks: Iterable[Task], *,
               progress: Callable[[int, int, RunResult], None] | None = None,
               ) -> tuple[dict[str, Solution], list[RunResult]]:
     tasks = list(tasks)
-    client = llm or DeepSeekClient()
+    client = llm or OpenAICompatibleClient()
     solver = AgentSolver(client, max_steps=max_steps,
                          max_cost_micro_cny=max_cost_micro_cny, cfg=cfg)
 

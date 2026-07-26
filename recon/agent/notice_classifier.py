@@ -84,13 +84,23 @@ SYSTEM = f"""你是支付清结算团队的对账人员。给你一条渠道公�
 """
 
 
-def _key(row) -> str:
+def _key(row, model_identity: str | None = None) -> str:
     # ⚠️ key 必须带版本：只用 body hash 的话，改了分类标准或换了模型之后
     #    旧缓存照旧命中，你会拿着旧标准的标签当成新标准的结果。
     payload = "|".join([
         row["body"], SCHEMA_VERSION,
         hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest()[:12],
-        os.environ.get("RECON_AGENT_MODEL", "deepseek-v4-flash"),
+        model_identity or "|".join([
+            os.environ.get("RECON_LLM_PROVIDER", "auto"),
+            os.environ.get("RECON_LLM_BASE_URL",
+                           os.environ.get("OPENAI_BASE_URL",
+                                          os.environ.get("DEEPSEEK_BASE_URL", ""))),
+            os.environ.get("RECON_LLM_MODEL",
+                           os.environ.get("OPENAI_MODEL",
+                                          os.environ.get(
+                                              "RECON_AGENT_MODEL",
+                                              "unconfigured"))),
+        ]),
     ])
     h = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     return f"{row['id']}:{h}"
@@ -146,7 +156,7 @@ def classify_all(conn, llm: LLMClient, *, use_cache: bool = True,
     out: dict[str, dict] = {}
     dirty = False
     for row in rows:
-        k = _key(row)
+        k = _key(row, getattr(llm, "identity", getattr(llm, "name", None)))
         if use_cache and k in cache:
             out[row["id"]] = {**cache[k], "cached": True, "fallback": False}
             continue

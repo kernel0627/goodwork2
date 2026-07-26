@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from recon import db
 from recon.agent import notice_classifier as nc
-from recon.agent.llm import FakeLLM, LLMError
+from recon.agent.llm import LLMError
 from recon.baseline.rules import RuleBaseline
 from recon.eval.evidence import EvidenceView
 from recon.eval.tasks import load_tasks
@@ -258,8 +258,12 @@ def test_cache_key_includes_schema_and_model_version(world, tmp_path):
         assert nc._key(row) != k1, "改了 SCHEMA_VERSION 后 key 必须变"
     finally:
         nc.SCHEMA_VERSION = old
-    os.environ["RECON_AGENT_MODEL"] = "some-other-model"
+    old_model = os.environ.get("RECON_LLM_MODEL")
+    os.environ["RECON_LLM_MODEL"] = "some-other-model"
     try:
         assert nc._key(row) != k1, "换了模型后 key 必须变"
     finally:
-        os.environ.pop("RECON_AGENT_MODEL", None)
+        if old_model is None:
+            os.environ.pop("RECON_LLM_MODEL", None)
+        else:
+            os.environ["RECON_LLM_MODEL"] = old_model
