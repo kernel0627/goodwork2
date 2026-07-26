@@ -12,7 +12,7 @@
 完整过程见 [STATUS.md](STATUS.md)。
 
 当前进度：**阶段 0~5.6 已完成；阶段 6.1 holdout 已封存、尚未正式评测；
-阶段 6.2 配对统计工具已完成、真实重复运行样本未齐**，210 个测试。
+阶段 6.2 配对统计工具已完成、真实重复运行样本未齐；阶段 7 高风险处置闭环已完成**。
 
 ---
 
@@ -23,7 +23,7 @@ cp .env.example .env          # 任选 OpenAI-compatible / OpenAI / DeepSeek / O
 python -m recon.cli llm-config # 只看最终解析结果；不联网、不泄露完整密钥
 pip install -r requirements.txt
 make build                    # 造世界：1400 订单 / 1192 条带答案的差错
-make test                     # 210 个测试（agent 侧全部离线，不联网）
+make test                     # 226 passed, 1 skipped（agent 侧全部离线，不联网）
 make route-dry                # 只跑闸门，看要花多少钱（零模型调用）
 make route                    # 核心交付物：规则优先路由 + 单次复核
 ```
@@ -76,7 +76,7 @@ RECON_LLM_API_KEY=你的密钥
 世界库怎么重建都不影响它。
 
 规模：开发世界 1192 条任务；独立 holdout 1185 条任务 / 31 条公告；
-210 个测试，19 张业务表 + 归档 2 张，6 份政策文档。
+19 张业务表 + 归档 2 张，6 份政策文档。
 
 ---
 
@@ -244,11 +244,10 @@ RECON_LLM_API_KEY=你的密钥
 1. **holdout 正式评测**：先用 `make holdout-check` 核验；确定模型、密钥和网络后，
    只运行一次 `CONFIRM_HOLDOUT=yes make holdout-eval`
 2. 收集 5~10 次同世界、同任务的独立运行，再生成正式配对统计报告
-3. 高风险闭环：审批、幂等、挂起—次日恢复、越权测试
-4. 让知识库变大，使 RAG 从装饰变成必须（历史工单库、政策版本历史）
-5. MCP 包一层
-6. 多轮 agent 轨迹接归档（现在只接了单次复核）
-7. 成本一栏仍是 0 —— `Pricing` 没配就如实显示未配置，**不拿猜的单价充数**；
+3. 让知识库变大，使 RAG 从装饰变成必须（历史工单库、政策版本历史）
+4. MCP 包一层
+5. 多轮 agent 轨迹接归档（现在只接了单次复核）
+6. 成本一栏仍是 0 —— `Pricing` 没配就如实显示未配置，**不拿猜的单价充数**；
    在 `.env` 填入输入、缓存输入、输出三档真实单价即可得到成本
 
 ---
@@ -266,6 +265,7 @@ recon/
     injector.py               ⭐ 22 类差错注入器，注入即标注
   matching.py                 对账匹配 + 业务规则扫描 + 结算合规扫描
   invariants.py               4 条金额不变量
+  workflow.py                 ⭐ 提案 / 人审 / 幂等执行 / 次日恢复
   holdout.py                  ⭐ 独立世界构建、三重指纹 seal、一次性状态机
   router.py                   ⭐ 零成本闸门 + 批量路由
   baseline/rules.py           善意强基线（检测器并行全跑）
