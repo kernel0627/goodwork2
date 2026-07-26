@@ -51,6 +51,7 @@ class RuleBaseline:
         ev.reset_trace()
         fires: list[Fire] = []
         refs: list[str] = []
+        facts: dict = {}
 
         diff = ev.diff(task.diff_id)
         if diff is None:
@@ -61,9 +62,9 @@ class RuleBaseline:
         elif diff["source"] == "rule_scan":
             fires += self._order_rule(ev, diff, refs)
         else:
-            fires += self._match(ev, diff, refs)
+            fires += self._match(ev, diff, refs, facts)
 
-        return self._compose(task, fires, ev, refs)
+        return self._compose(task, fires, ev, refs, facts=facts)
 
     # ------------------------------------------------------- 结算合规扫描
     def _settlement(self, ev, diff, refs) -> list[Fire]:
@@ -95,7 +96,8 @@ class RuleBaseline:
         return []
 
     # ----------------------------------------------------------- 流水匹配
-    def _match(self, ev, diff, refs) -> list[Fire]:
+    def _match(self, ev, diff, refs, facts: dict | None = None) -> list[Fire]:
+        facts = facts if facts is not None else {}
         txn = diff["channel_txn_no"]
         ch = ev.channel_cfg(diff["channel_id"])
         recs = ev.channel_records_by_txn(txn)
@@ -154,7 +156,20 @@ class RuleBaseline:
         # 系统性误报 D05（旧版就是这样把 D06 全部判成 D05,D06）。
         if pay and pay["status"] == "success" and our_gross is not None:
             std = ch.fee_rule.compute(our_gross)
+            # 结构化记下手续费三方对照。D05 与 D22 的分辨点就是「偏离的是哪一侧」，
+            # 而费率误用公告声明的正是「商户侧记账正确、错在渠道」。
+            # 让下游从这里读，比从 notes 的中文里读可靠。
+            _prs = [r for r in recs if r["rec_type"] == "payment"]
+            facts["fee"] = {
+                "our_fee_cents": our_fee,
+                "standard_fee_cents": std,
+                "channel_fee_cents": _prs[0]["fee_cents"] if _prs else None,
+                "our_matches_standard": abs(our_fee - std) < 2,
+                "channel_matches_standard": (abs(_prs[0]["fee_cents"] - std) < 2
+                                             if _prs else None),
+            }
             if abs(our_fee - std) >= 2:
+                facts["fee"]["deviating_side"] = "ours"
                 fires.append(Fire("D05", f"我方手续费 {our_fee} 分，按标准费率复算应为 "
                                          f"{std} 分，差 {our_fee - std} 分"))
             else:
@@ -164,8 +179,9 @@ class RuleBaseline:
                 # D04 已经用「手续费未单列」解释了这笔差额，不能再拿同一份证据
                 # 指控渠道费率偏差 —— 会系统性把 D04 误报成 D04,D05。
                 already = any(f.code == "D04" for f in fires)
-                prs = [r for r in recs if r["rec_type"] == "payment"]
+                prs = _prs
                 if not already and prs and abs(prs[0]["fee_cents"] - std) >= 2:
+                    facts["fee"]["deviating_side"] = "channel"
                     fires.append(Fire("D05", f"渠道手续费 {prs[0]['fee_cents']} 分与合同费率"
                                              f"复算值 {std} 分不符，差 "
                                              f"{prs[0]['fee_cents'] - std} 分，冲正差额"))
@@ -280,7 +296,8 @@ class RuleBaseline:
 
     # ------------------------------------------------------------------
     def _compose(self, task: Task, fires: list[Fire], ev: EvidenceView,
-                 refs: list[str], note: str = "") -> Solution:
+                 refs: list[str], note: str = "", *,
+                 facts: dict | None = None) -> Solution:
         codes: list[str] = []
         for f in fires:
             if f.code not in codes:

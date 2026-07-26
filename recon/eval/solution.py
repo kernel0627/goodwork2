@@ -17,6 +17,11 @@ class Solution:
     confidence: float = 0.0                                # 0-1
     notes: str = ""
 
+    # 求解过程中算出来的结构化事实。notes 是给人看的自由文本，facts 是给下游
+    # 程序看的 —— 复核器要判「偏离合同费率的是哪一侧」，从自由文本里读容易读错，
+    # 从这里读不会。不入库，只在进程内传递。
+    facts: dict = field(default_factory=dict)
+
     # ---- 过程（用于成本-效果对比）----
     evidence_refs: list[str] = field(default_factory=list)  # "表:id"
     reads: int = 0            # 取证次数
