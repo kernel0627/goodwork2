@@ -1113,3 +1113,38 @@ Ak ↔ Bk
 2. 用 `recon.eval.paired_stats` 生成正式配对统计报告
 3. 只有效应量、95% CI、McNemar 与风险指标方向一致时才写正式结论
 4. holdout 仍留到最终封板，只运行一次
+
+---
+
+# 工程修正：LLM 配置改为 OpenAI-compatible 自适应层
+
+原来的 `.env` 设计把 DeepSeek 的变量名、端点和模型假设写进了客户端，换 OpenAI、
+兼容网关或本地模型时需要改代码，接口能力稍有差异也容易直接失败。这一层已经重做。
+
+## 已实现
+
+- [x] 推荐统一使用 `RECON_LLM_MODEL`、`RECON_LLM_BASE_URL`、
+  `RECON_LLM_API_KEY`
+- [x] 固定解析优先级：命令参数 → `RECON_LLM_*` → `OPENAI_*` →
+  `DEEPSEEK_*` → `OLLAMA_*` / `VLLM_*`
+- [x] 旧的 DeepSeek `.env` 和 `DeepSeekClient` 名称继续兼容
+- [x] Ollama / 本地 vLLM 自动识别本地地址、补齐 `/v1`，不强制真实密钥
+- [x] `response_format` 不受支持时，自动退回提示词约束和 JSON 对象解析
+- [x] `max_tokens` 不受支持时，自动切换为 `max_completion_tokens`
+- [x] 接口拒绝 `temperature` 时，只移除这一能力后重试
+- [x] 兼容 fenced JSON、对象前后少量说明文字、分块消息和缺失 usage 的响应
+- [x] `python -m recon.cli llm-config` / `make llm-config` 只在本地解析配置，
+  不联网，密钥只显示为 `(configured)`
+- [x] 新旧价格变量均可读取，缺少 usage 时不会伪造 token 或成本
+
+## 当前验收
+
+- LLM 配置、能力降级、公告缓存和 Agent 专项：**67 passed, 1 skipped**
+- 全套：**210 passed, 1 skipped**
+- `llm-config`：成功读取现有旧版 DeepSeek 配置，未发网络请求，未输出密钥内容
+- holdout seal：校验通过，状态仍为 **`sealed`**
+- 本次模型调用：**0**
+
+`.env.example` 现在给出通用配置、OpenAI、旧版 DeepSeek、Ollama 和 vLLM 示例。
+配置解析不会偷偷探测网络；端点能力只在真正请求遭遇明确“不支持参数”错误时进行
+最小范围降级，认证失败和普通请求错误仍然直接报错。
