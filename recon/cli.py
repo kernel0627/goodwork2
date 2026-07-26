@@ -45,6 +45,40 @@ def cli() -> None:
 
 # --------------------------------------------------------------------------
 
+@cli.command("llm-config")
+@click.option("--model", default=None, help="仅用于预览的模型名覆盖")
+def llm_config_cmd(model: str | None) -> None:
+    """解析并安全展示最终 LLM 配置；不联网、不显示完整密钥。"""
+    from .agent.llm import LLMError, resolve_model_config
+
+    try:
+        cfg = resolve_model_config(model)
+    except LLMError as exc:
+        raise click.ClickException(str(exc)) from exc
+    safe = cfg.safe_dict()
+    table = Table(title="LLM 配置解析结果", show_header=False)
+    table.add_column(style="cyan")
+    table.add_column(overflow="fold")
+    labels = {
+        "provider": "供应商",
+        "model": "模型",
+        "base_url": "端点",
+        "api_key": "密钥",
+        "json_mode": "JSON 模式",
+        "token_param": "token 参数",
+        "timeout_seconds": "超时（秒）",
+        "max_retries": "重试",
+        "source": "命中配置",
+        "identity": "缓存身份",
+    }
+    for key, label in labels.items():
+        table.add_row(label, str(safe[key]))
+    console.print(table)
+    console.print("[green]只完成本地解析，未发送网络请求。[/]")
+
+
+# --------------------------------------------------------------------------
+
 @cli.command("init-db")
 @click.option("--reset", is_flag=True, help="删库重建")
 @click.option("--db-path", default=None)
@@ -421,7 +455,7 @@ def eval_baseline_cmd(db_path: str | None, limit: int | None,
 @click.option("--limit", default=60, show_default=True, help="抽样任务数（跑全量要花钱）")
 @click.option("--workers", default=8, show_default=True, help="并发数")
 @click.option("--max-steps", default=14, show_default=True, help="每条差错最多几轮决策")
-@click.option("--model", default=None, help="覆盖 RECON_AGENT_MODEL")
+@click.option("--model", default=None, help="覆盖 RECON_LLM_MODEL")
 @click.option("--all-tasks", is_flag=True, help="跑全量，不抽样")
 @click.option("--save/--no-save", default=True)
 def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int,
@@ -430,7 +464,7 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
 
     这条命令的产出就是整个项目的核心交付物：那张对比表。
     """
-    from .agent.llm import DeepSeekClient, Pricing
+    from .agent.llm import OpenAICompatibleClient, Pricing
     from .agent.solver import persist_runs, run_agent, stop_reason_stats, tool_usage_stats
     from .baseline.rules import run_baseline
     from .eval import report as rp
@@ -455,10 +489,12 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
     pricing = Pricing.from_env()
     if not pricing.configured:
         console.print("[yellow]价格未配置[/]，成本一栏按 0 显示。"
-                      "配 RECON_PRICE_IN_MISS_PER_MTOK / _IN_HIT_ / _OUT_ 后才有成本数字。")
+                      "填写 RECON_PRICE_INPUT_PER_MTOK / "
+                      "_CACHED_INPUT_ / _OUTPUT_ 后才有成本数字。")
 
-    client = DeepSeekClient(model=model)
-    console.print(f"模型：[cyan]{client.name}[/]  并发 {workers}  最多 {max_steps} 轮/条")
+    client = OpenAICompatibleClient(model=model)
+    console.print(f"模型：[cyan]{client.provider}:{client.name}[/]  "
+                  f"并发 {workers}  最多 {max_steps} 轮/条")
 
     done = {"n": 0}
 
@@ -521,7 +557,7 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
 def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
               model: str | None, dry_run: bool, mode: str, gate: str,
               save: bool, report_stem: str | None,
-              archive_results: bool) -> None:
+              archive_results: bool) -> dict | None:
     """规则优先路由 —— 规则先跑，只把它注定读不到的那部分交给模型。
 
     --dry-run 只跑闸门：路由比例、需读文本召回、放行部分正确率，全部零 token。
@@ -530,7 +566,7 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
     两种 inner 的区别是输出空间：review 只能维持或 D01→D21 / D05→D22，
     resolve 可以给出任意归因 —— 所以闸门误触的那些题在 review 下更安全。
     """
-    from .agent.llm import DeepSeekClient
+    from .agent.llm import OpenAICompatibleClient
     from .agent.reviewer import review_stats, run_review
     from .agent.solver import run_agent
     from .baseline.rules import RuleBaseline, run_baseline
@@ -546,6 +582,7 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
     every = load_tasks(conn)
     if not every:
         console.print("[red]任务集为空，先跑 make build[/]")
+        conn.close()
         return
     tasks = every if all_tasks else sample_tasks(every, limit, ensure=default_ensure(limit))
     n_text = sum(1 for t in tasks if set(t.gold_codes) & TEXT_DEPENDENT_CODES)
@@ -556,7 +593,7 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
     if gate == "typed":
         from .agent.notice_classifier import (classify_all, covering_dates,
                                               label_stats)
-        client0 = DeepSeekClient(model=model)
+        client0 = OpenAICompatibleClient(model=model)
         labels = classify_all(conn, client0)
         ls = label_stats(labels)
         console.print(f"公告分类：{ls['notices']} 条，本次实际调用 "
@@ -598,8 +635,9 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
         return
 
     # ---- 只对被路由的那批调模型 ----
-    client = DeepSeekClient(model=model)
-    console.print(f"\n模型 [cyan]{client.name}[/]，模式 [cyan]{mode}[/]，"
+    client = OpenAICompatibleClient(model=model)
+    console.print(f"\n模型 [cyan]{client.provider}:{client.name}[/]，"
+                  f"模式 [cyan]{mode}[/]，"
                   f"只跑被路由的 {s['routed']} 条")
 
     stats = None
@@ -645,10 +683,27 @@ def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
     console.rule("[bold]规则基线 vs 规则优先路由[/]")
     rp.print_comparison(reps)
     if save:
+        from .eval.paired_stats import (compare_outcomes,
+                                        comparison_markdown)
+
         p = DOCS / f"{report_stem or f'stage4_router_{mode}_{gate}'}.md"
-        p.write_text(rp.comparison_markdown(reps, tasks=tasks), encoding="utf-8")
+        paired = compare_outcomes(
+            reps[0].solver, {g.task_id: g.attr_exact for g in reps[0].grades},
+            reps[1].solver, {g.task_id: g.attr_exact for g in reps[1].grades})
+        report_text = rp.comparison_markdown(reps, tasks=tasks)
+        report_text += "\n\n" + comparison_markdown(
+            [paired], metric="attr_exact", heading_level=2)
+        p.write_text(report_text, encoding="utf-8")
         console.print(f"[green]已写入[/] {p}")
     conn.close()
+    return {
+        "tasks": tasks,
+        "reports": reps,
+        "review_results": review_results or [],
+        "model": client.name,
+        "mode": mode,
+        "gate": gate,
+    }
 
 
 @cli.command("holdout-build")
@@ -698,6 +753,58 @@ def holdout_check_cmd() -> None:
                   f"公告：{summary['notices']}，场景：{summary['scenarios']}")
 
 
+def _holdout_result_payload(route_result: dict) -> dict:
+    """把一次性结果保存到专用审计件，不进入训练轨迹归档。"""
+    tasks = {t.task_id: t for t in route_result["tasks"]}
+    base, candidate = route_result["reports"]
+    base_grades = {g.task_id: g for g in base.grades}
+    candidate_grades = {g.task_id: g for g in candidate.grades}
+    reviews = {r.task_id: r for r in route_result["review_results"]}
+
+    def grade_value(g):
+        return {
+            "pred_codes": list(g.pred_codes),
+            "pred_actions": list(g.pred_actions),
+            "pred_status": g.pred_status,
+            "attr_exact": g.attr_exact,
+            "action_exact": g.action_exact,
+            "status_ok": g.status_ok,
+            "wrong_money_action": g.wrong_money_action,
+            "unauthorized": g.unauthorized,
+            "missed_escalation": g.missed_escalation,
+        }
+
+    rows = []
+    for task_id in sorted(tasks):
+        task = tasks[task_id]
+        review = reviews.get(task_id)
+        rows.append({
+            "task_id": task_id,
+            "diff_id": task.diff_id,
+            "gold": {
+                "codes": list(task.gold_codes),
+                "actions": list(task.gold_actions),
+                "status": task.gold_status,
+            },
+            "rule": grade_value(base_grades[task_id]),
+            "candidate": grade_value(candidate_grades[task_id]),
+            "model_trace": ({
+                "messages": review.messages,
+                "raw_response": review.raw_response,
+                "parsed_ok": review.parsed_ok,
+                "error": review.error,
+            } if review else None),
+        })
+    return {
+        "version": "stage6-holdout-result-v1",
+        "model": route_result["model"],
+        "mode": route_result["mode"],
+        "gate": route_result["gate"],
+        "solvers": [base.solver, candidate.solver],
+        "rows": rows,
+    }
+
+
 @cli.command("holdout-eval")
 @click.option("--confirm-once", is_flag=True,
               help="确认开始一次性正式评测；运行、失败或完成后均拒绝重跑")
@@ -705,9 +812,9 @@ def holdout_check_cmd() -> None:
 @click.option("--model", default=None)
 def holdout_eval_cmd(confirm_once: bool, workers: int, model: str | None) -> None:
     """一次性正式评测。结果不进入训练轨迹归档，避免 holdout 答案泄漏。"""
-    from .agent.llm import DeepSeekClient
-    from .holdout import (HOLDOUT_DB, HOLDOUT_SEAL, set_evaluation_state,
-                          verify_seal)
+    from .agent.llm import OpenAICompatibleClient
+    from .holdout import (HOLDOUT_DB, HOLDOUT_RESULTS, HOLDOUT_SEAL,
+                          set_evaluation_state, verify_seal, write_results)
 
     if not confirm_once:
         raise click.ClickException(
@@ -721,26 +828,30 @@ def holdout_eval_cmd(confirm_once: bool, workers: int, model: str | None) -> Non
 
     # 只做本地客户端预检，不读取 holdout、不发网络请求。配置错误不消耗一次机会。
     try:
-        DeepSeekClient(model=model)
+        OpenAICompatibleClient(model=model)
     except Exception as exc:
         raise click.ClickException(f"模型客户端预检失败，正式评测尚未开始：{exc}") from exc
 
     report = DOCS / "stage6_holdout_v1.md"
     set_evaluation_state("running", seal_path=HOLDOUT_SEAL)
     try:
-        route_cmd.callback(  # type: ignore[union-attr]
+        result = route_cmd.callback(  # type: ignore[union-attr]
             db_path=str(HOLDOUT_DB), limit=60, all_tasks=True,
             workers=workers, model=model, dry_run=False, mode="review",
             gate="any", save=True, report_stem=report.stem,
             archive_results=False)
+        if result is None:
+            raise RuntimeError("holdout route 没有返回正式结果")
+        write_results(_holdout_result_payload(result), HOLDOUT_RESULTS)
+        set_evaluation_state(
+            "complete", report=str(report.relative_to(db.PROJECT_ROOT)),
+            results=str(HOLDOUT_RESULTS.relative_to(db.PROJECT_ROOT)),
+            seal_path=HOLDOUT_SEAL)
     except Exception as exc:
         set_evaluation_state(
             "failed", error=f"{type(exc).__name__}: {exc}",
             seal_path=HOLDOUT_SEAL)
         raise
-    set_evaluation_state(
-        "complete", report=str(report.relative_to(db.PROJECT_ROOT)),
-        seal_path=HOLDOUT_SEAL)
     console.print("[green]一次性正式评测完成。[/]")
 
 
@@ -865,7 +976,7 @@ def variance_cmd(db_path: str | None, limit: int, repeat: int, workers: int,
        不知道噪声下限就去追这种差异，是把噪声当结论。
     """
     from .agent.config import ablation_ladder
-    from .agent.llm import DeepSeekClient
+    from .agent.llm import OpenAICompatibleClient
     from .agent.solver import run_agent
     from .eval import variance as va
     from .eval.grader import aggregate
@@ -877,7 +988,7 @@ def variance_cmd(db_path: str | None, limit: int, repeat: int, workers: int,
     pool = load_tasks(conn, split=split)
     tasks = pool if split == "text" else sample_tasks(pool, limit,
                                                       ensure=default_ensure(limit))
-    client = DeepSeekClient(model=model)
+    client = OpenAICompatibleClient(model=model)
     cfg = ablation_ladder(client.name)[rung]
     console.print(f"配置 [cyan]{cfg.label()}[/]  档位 [magenta]{split}[/]  "
                   f"{len(tasks)} 条任务，独立跑 [bold]{repeat}[/] 次"
@@ -937,7 +1048,7 @@ def ablate_cmd(db_path: str | None, limit: int, workers: int,
     这张表回答的是「哪个改动值多少个点」，而不是笼统的「优化后提升了 N%」。
     """
     from .agent.config import ablation_ladder
-    from .agent.llm import DeepSeekClient
+    from .agent.llm import OpenAICompatibleClient
     from .agent.solver import run_agent, stop_reason_stats
     from .baseline.rules import run_baseline
     from .eval import report as rp
@@ -952,7 +1063,7 @@ def ablate_cmd(db_path: str | None, limit: int, workers: int,
     console.print(f"任务 [bold]{len(tasks)}[/] 条（需读自由文本 [magenta]{n_text}[/] 条），"
                   f"所有配置跑同一批")
 
-    client = DeepSeekClient(model=model)
+    client = OpenAICompatibleClient(model=model)
     reps = [aggregate("rule_baseline", tasks, run_baseline(conn, tasks))]
 
     for cfg in ablation_ladder(client.name):

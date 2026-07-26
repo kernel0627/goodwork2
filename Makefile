@@ -13,7 +13,8 @@ INJECT ?= 120
 
 .PHONY: help build test check stats report case case-composite repro clean all \
         tasks baseline agent replay variance ablate route scenarios \
-        archive-stats archive-export holdout-build holdout-check holdout-eval
+        archive-stats archive-export holdout-build holdout-check holdout-eval \
+        paired-stats llm-config
 
 help:
 	@echo "make build            生成完整业务世界 + 带答案的差错池（一条命令）"
@@ -27,6 +28,7 @@ help:
 	@echo "make baseline         跑纯规则基线并判分（阶段 1 核心动作）"
 	@echo "make agent            跑 Agent 并与规则基线同表对比（阶段 2 核心动作）"
 	@echo "make replay           回放一条判错的 agent 轨迹"
+	@echo "make llm-config       安全显示最终模型配置（不联网、不显示完整密钥）"
 	@echo "make route            规则优先路由 + 单次复核（核心交付物）"
 	@echo "make route-dry        只跑闸门，看要花多少钱"
 	@echo "make variance         同配置重复跑，量方差与 pass^k"
@@ -35,6 +37,7 @@ help:
 	@echo "make holdout-build    构建并封存阶段 6 holdout（不调用模型）"
 	@echo "make holdout-check    核验 holdout 未被改动及一次性评测状态"
 	@echo "make holdout-eval     一次性正式评测（需 CONFIRM_HOLDOUT=yes）"
+	@echo "make paired-stats     对归档 run 做严格配对统计（需 PAIRED_ARGS）"
 	@echo "make all              build + test + report"
 	@echo ""
 	@echo "参数：SEED=$(SEED) START=$(START) DAYS=$(DAYS) ORDERS=$(ORDERS) INJECT=$(INJECT)"
@@ -42,6 +45,9 @@ help:
 build:
 	$(PY) -m recon.cli build --seed $(SEED) --start $(START) --days $(DAYS) \
 		--orders-per-day $(ORDERS) --inject-per-day $(INJECT)
+
+llm-config:
+	$(PY) -m recon.cli llm-config
 
 test:
 	$(PY) -m pytest -q
@@ -114,6 +120,18 @@ holdout-eval:
 		exit 2; \
 	fi
 	$(PY) -m recon.cli holdout-eval --confirm-once --workers $(AGENT_WORKERS)
+
+PAIRED_ARGS   ?=
+PAIRED_METRIC ?= attr_exact
+PAIRED_OUT    ?= docs/stage6_paired_stats.md
+
+paired-stats:
+	@if [ -z "$(PAIRED_ARGS)" ]; then \
+		echo "缺少运行对，例如：PAIRED_ARGS='--pair RUN_A RUN_B' make paired-stats"; \
+		exit 2; \
+	fi
+	$(PY) -m recon.eval.paired_stats $(PAIRED_ARGS) --metric $(PAIRED_METRIC) \
+		--out $(PAIRED_OUT)
 
 all: build test report baseline
 

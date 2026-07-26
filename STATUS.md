@@ -36,7 +36,7 @@
 | 4 | 规则优先路由 + 单次复核器 + 公告分类闸门 | ✅ 完成 |
 | 5 | 把世界做难（三类难公告）+ 结构化窗口事实 | ✅ 完成 |
 | 5.5 | 外部 review 的 3 个 P0 安全语义 + 工程化 | ✅ 完成 |
-| 6 | holdout + 统计口径升级 | 🟡 holdout 已封存、未正式评测；统计口径未开始 |
+| 6 | holdout + 统计口径升级 | 🟡 holdout 已封存；统计工具完成，真实重复运行 1/5 |
 | 7 | 高风险闭环：审批、幂等、挂起-次日恢复、越权测试 | ⬜ 未开始 |
 | 8 | 工作台 + trace 回放 | ⬜ 未开始 |
 | — | 小模型 SFT | ❌ **明确不做**，见 `docs/training_deferred.md` |
@@ -1006,8 +1006,10 @@ override 目标 D21 对应的源编码 D01 不在规则结论 ['D05'] 里，无�
 - [x] 三重 SHA-256 seal：世界实际行内容、冻结语料/规则、完整评测器
 - [x] 一次性状态机：`sealed → running → complete|failed`，禁止回退和重跑
 - [x] 正式评测不写 `archive.db`，避免 holdout 答案进入 SFT 数据
+- [x] 正式报告内置 paired bootstrap 95% CI 与 exact McNemar
+- [x] 逐任务结果写入独立审计件，报告和结果都由 seal 记录 SHA-256
 - [x] `holdout-build` / `holdout-check` / `holdout-eval --confirm-once`
-- [x] `tests/test_holdout.py`：8 个防泄漏与组合闭合测试
+- [x] `tests/test_holdout.py`：10 个防泄漏、结果审计与组合闭合测试
 
 ## 冻结世界
 
@@ -1028,14 +1030,14 @@ override 目标 D21 对应的源编码 D01 不在规则结论 ['D05'] 里，无�
 正式指纹：
 
 - 世界：`aa2e014a358265ffa2ba6580151248bb8ba9c4f97b7e3b2cd392b2d39b5cf433`
-- 评测器：`ad34656a1351480d14c28586ddd1bc8af29c3d15b4adfe90e4a14eec890b7614`
+- 评测器：`99fe3e736ee5c1e9bf73bed9db401664d73f1af592b4d6724491d71e0d0dd438`
 
 协议详见 `docs/stage6_holdout_protocol.md`。
 
 ## 当前验收
 
-- `tests/test_holdout.py`：**8 passed**
-- 全套：**185 passed, 1 skipped**
+- `tests/test_holdout.py`：**10 passed**
+- 全套：**210 passed, 1 skipped**
 - holdout 闸门 dry-run：路由 **396/1185（33.4%）**，需读文本召回
   **104/104**，放行部分 **789/789** 归因 exact
 - `make holdout-check`：通过
@@ -1050,3 +1052,64 @@ override 目标 D21 对应的源编码 D01 不在规则结论 ['D05'] 里，无�
 2. 统计口径升级：同任务同运行编号的 paired comparison、paired bootstrap、
    McNemar、5~10 次开发集独立运行、95% CI
 3. holdout 正式报告只陈述一次性结果，不针对结果修改后重跑
+
+---
+
+# 阶段 6.2：配对统计工具完成，真实重复运行样本未齐
+
+## 口径
+
+聚合准确率相减无法回答“同一条任务上到底谁翻转了”。现在以同运行编号严格配对：
+
+```text
+A1 ↔ B1
+A2 ↔ B2
+……
+Ak ↔ Bk
+```
+
+每一对必须满足世界指纹相同、任务集合完全相同、同一任务 gold 相同、每任务恰有一个
+判分行。任何条件不满足都直接拒绝，不能静默取交集。
+
+## 已实现
+
+- [x] `recon/eval/paired_stats.py`
+- [x] A/B accuracy 的 Wilson 95% CI
+- [x] 逐任务 $B-A$ 的 paired bootstrap 95% CI
+- [x] 二元 exact 指标的双侧 exact McNemar
+- [x] 5~10 次重复运行的分层 paired bootstrap：先抽运行，再在运行内抽任务
+- [x] `attr_exact` / `action_exact` 两种二元指标
+- [x] 显式 bootstrap 次数与 seed，同 seed 完全可复现
+- [x] 可重复传 `--pair RUN_A RUN_B` 的独立报告入口
+- [x] `make paired-stats`，缺运行对时拒绝执行
+- [x] `tests/test_paired_stats.py`：9 个定义、边界和归档集成测试
+
+协议详见 `docs/stage6_paired_statistics.md`。
+
+## 当前数据边界
+
+`data/archive.db` 当前只有：
+
+| | |
+|---|---:|
+| 真实运行 | **1** |
+| 轨迹 | **336** |
+| 最低正式要求 | **5 次独立运行** |
+
+因此现在只能确认统计管线可用，**不能给出真实 p 值、95% CI 或稳定性结论**。
+没有擅自发起额外模型调用。
+
+## 当前验收
+
+- 配对统计专项：**9 passed**
+- holdout 专项：**10 passed**
+- 全套：**210 passed, 1 skipped**
+- holdout seal：通过，状态仍为 **`sealed`**
+- holdout 模型调用：**0**
+
+## 下一步
+
+1. 在开发世界固定代码、模型、任务集合和配置，采集 5~10 次 A/B 同编号运行
+2. 用 `recon.eval.paired_stats` 生成正式配对统计报告
+3. 只有效应量、95% CI、McNemar 与风险指标方向一致时才写正式结论
+4. holdout 仍留到最终封板，只运行一次

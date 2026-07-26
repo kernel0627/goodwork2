@@ -11,18 +11,19 @@
 这个结论是被自己的测量逼出来的，不是先想好的 —— 中间推翻过四次自己的判断。
 完整过程见 [STATUS.md](STATUS.md)。
 
-当前进度：**阶段 0~5.6 已完成，阶段 6.1 holdout 已封存、尚未正式评测**，
-185 个测试。
+当前进度：**阶段 0~5.6 已完成；阶段 6.1 holdout 已封存、尚未正式评测；
+阶段 6.2 配对统计工具已完成、真实重复运行样本未齐**，210 个测试。
 
 ---
 
 ## 30 秒上手
 
 ```bash
-cp .env.example .env          # 填入 DEEPSEEK_API_KEY
+cp .env.example .env          # 任选 OpenAI-compatible / OpenAI / DeepSeek / Ollama / vLLM
+python -m recon.cli llm-config # 只看最终解析结果；不联网、不泄露完整密钥
 pip install -r requirements.txt
 make build                    # 造世界：1400 订单 / 1192 条带答案的差错
-make test                     # 185 个测试（agent 侧全部离线，不联网）
+make test                     # 210 个测试（agent 侧全部离线，不联网）
 make route-dry                # 只跑闸门，看要花多少钱（零模型调用）
 make route                    # 核心交付物：规则优先路由 + 单次复核
 ```
@@ -32,6 +33,24 @@ make route                    # 核心交付物：规则优先路由 + 单次复
 `make replay`（回放一条判错的轨迹）、`make repro`（验证可复现）、
 `make archive-stats`（累计攒了多少轨迹）、`make archive-export`（导出 SFT 用 JSONL）、
 `make holdout-build`（只构建并封存，不调模型）、`make holdout-check`（核验封存状态）。
+
+### 模型配置
+
+推荐只填三个通用变量：
+
+```bash
+RECON_LLM_MODEL=你的模型名
+RECON_LLM_BASE_URL=https://你的兼容端点/v1
+RECON_LLM_API_KEY=你的密钥
+```
+
+配置解析顺序固定为：命令参数 → `RECON_LLM_*` → `OPENAI_*` →
+旧 `DEEPSEEK_*` → 本地 `OLLAMA_*` / `VLLM_*`。已有 DeepSeek `.env`
+无需迁移；本地端点无需伪造真实密钥。
+
+不同兼容接口的能力差异也会自动处理：不支持 `response_format` 时退回提示词约束
+和严格 JSON 解析；不支持 `max_tokens` 时改用 `max_completion_tokens`；
+不支持 `temperature` 时省略该参数。自动选择只根据本地配置，**不会偷偷探网或试模型**。
 
 ---
 
@@ -57,7 +76,7 @@ make route                    # 核心交付物：规则优先路由 + 单次复
 世界库怎么重建都不影响它。
 
 规模：开发世界 1192 条任务；独立 holdout 1185 条任务 / 31 条公告；
-185 个测试，19 张业务表 + 归档 2 张，6 份政策文档。
+210 个测试，19 张业务表 + 归档 2 张，6 份政策文档。
 
 ---
 
@@ -187,7 +206,7 @@ make route                    # 核心交付物：规则优先路由 + 单次复
 | | 说明 |
 |---|---|
 **泛化可信度** | holdout 已封存但尚未正式评测；当前 100% 仍只证明开发世界闭合 |
-**统计口径** | 「噪声下限」是 3 次运行极差/2，工程启发式而非统计显著性。该上 paired bootstrap / McNemar，5~10 次重复，报 95% CI |
+**统计口径** | paired bootstrap / exact McNemar / Wilson 95% CI 工具已完成；归档目前只有 1 次真实 run，未达到 5~10 次要求，暂不下显著性结论 |
 **RAG** | 完全没有。知识库只有 386 行 / 6 份，整篇进 context 就够 —— 但这是因为我把世界做小了，不是因为不需要 |
 **MCP** | 完全没有。14 个工具已有 schema 和分级，包一层 server 成本很低 |
 **训练 / SFT** | 明确不做，理由与设计写在 [docs/training_deferred.md](docs/training_deferred.md)。但数据已经在攒了 —— 见下 |
@@ -224,13 +243,13 @@ make route                    # 核心交付物：规则优先路由 + 单次复
 
 1. **holdout 正式评测**：先用 `make holdout-check` 核验；确定模型、密钥和网络后，
    只运行一次 `CONFIRM_HOLDOUT=yes make holdout-eval`
-2. 统计口径升级：paired bootstrap / McNemar / 95% CI
+2. 收集 5~10 次同世界、同任务的独立运行，再生成正式配对统计报告
 3. 高风险闭环：审批、幂等、挂起—次日恢复、越权测试
 4. 让知识库变大，使 RAG 从装饰变成必须（历史工单库、政策版本历史）
 5. MCP 包一层
 6. 多轮 agent 轨迹接归档（现在只接了单次复核）
 7. 成本一栏仍是 0 —— `Pricing` 没配就如实显示未配置，**不拿猜的单价充数**；
-   在 `.env` 填入 DeepSeek 三档单价即可得到真实成本
+   在 `.env` 填入输入、缓存输入、输出三档真实单价即可得到成本
 
 ---
 
@@ -251,7 +270,7 @@ recon/
   router.py                   ⭐ 零成本闸门 + 批量路由
   baseline/rules.py           善意强基线（检测器并行全跑）
   agent/
-    llm.py                    DeepSeek 客户端、永久性错误快速失败、离线 FakeLLM
+    llm.py                    通用 OpenAI-compatible 客户端、自适应能力降级、离线 FakeLLM
     tools.py                  14 个工具，其中 4 个是确定性计算工具
     loop.py                   多轮 harness（作为对照组保留）
     reviewer.py               ⭐ 单次复核器 + 结构化事实块 + 严格输出校验
@@ -260,6 +279,7 @@ recon/
   eval/
     evidence.py               ⭐ 受控证据层（白名单 / 轨迹 / 预算 / as_of）
     grader.py                 归因 / 处置 / 风险（条数+金额）/ 分组
+    paired_stats.py           ⭐ 严格配对 / bootstrap 95% CI / exact McNemar
     scenarios.py              ⭐ 难点场景分档 + 样本量守卫
     variance.py               方差 / pass^k / 翻转率 / 噪声下限
     report.py                 终端表 + markdown + 多求解方对比

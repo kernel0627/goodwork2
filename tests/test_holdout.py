@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from recon import db
 from recon.agent.reviewer import _task_prompt, _txn_amount, _txn_time
 from recon.baseline.rules import RuleBaseline
+from recon.cli import _holdout_result_payload
 from recon.eval.evidence import EvidenceView
 from recon.eval.grader import grade_one
 from recon.eval.scenarios import ScenarioView
@@ -163,6 +165,62 @@ def test_evaluation_state_is_forward_only(frozen_holdout, tmp_path):
     set_evaluation_state("failed", error="simulated", seal_path=copied)
     with pytest.raises(HoldoutError, match="非法 holdout 评测状态迁移"):
         set_evaluation_state("running", seal_path=copied)
+
+
+def test_completed_seal_fingerprints_report_and_task_results(
+        frozen_holdout, tmp_path):
+    _, db_path, _, _, seal = frozen_holdout
+    copied = tmp_path / "complete.seal.json"
+    copied.write_text(json.dumps(seal, ensure_ascii=False), encoding="utf-8")
+    report = tmp_path / "report.md"
+    results = tmp_path / "results.json"
+    report.write_text("# formal result\n", encoding="utf-8")
+    results.write_text('{"rows":[]}\n', encoding="utf-8")
+
+    set_evaluation_state("running", seal_path=copied)
+    complete = set_evaluation_state(
+        "complete", report=str(report), results=str(results),
+        seal_path=copied)
+    assert complete["evaluation"]["report_fingerprint"]
+    assert complete["evaluation"]["results_fingerprint"]
+    verify_seal(db_path, copied)
+
+    results.write_text('{"rows":[{"tampered":true}]}\n', encoding="utf-8")
+    with pytest.raises(HoldoutError, match="results 审计件在完成后被修改"):
+        verify_seal(db_path, copied)
+
+
+def test_holdout_result_payload_keeps_input_and_gold_separate():
+    task = SimpleNamespace(
+        task_id="T1", diff_id="D1", gold_codes=("D22",),
+        gold_actions=("HOLD_NEXT_BILL",), gold_status="held")
+
+    def grade(pred, exact):
+        return SimpleNamespace(
+            task_id="T1", pred_codes=(pred,), pred_actions=("HOLD_NEXT_BILL",),
+            pred_status="held", attr_exact=exact, action_exact=True,
+            status_ok=True, wrong_money_action=False, unauthorized=False,
+            missed_escalation=False)
+
+    review = SimpleNamespace(
+        task_id="T1",
+        messages=[{"role": "user", "content": "只含公告输入"}],
+        raw_response='{"covered":true}', parsed_ok=True, error="")
+    payload = _holdout_result_payload({
+        "tasks": [task],
+        "reports": [
+            SimpleNamespace(solver="rule", grades=[grade("D05", False)]),
+            SimpleNamespace(solver="router", grades=[grade("D22", True)]),
+        ],
+        "review_results": [review],
+        "model": "fake", "mode": "review", "gate": "any",
+    })
+    row = payload["rows"][0]
+    assert row["gold"]["codes"] == ["D22"]
+    assert row["candidate"]["attr_exact"] is True
+    assert row["model_trace"]["messages"] == review.messages
+    assert "D22" not in json.dumps(
+        row["model_trace"]["messages"], ensure_ascii=False)
 
 
 def test_real_holdout_artifacts_are_outside_test_fixture(frozen_holdout):

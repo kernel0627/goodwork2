@@ -26,6 +26,7 @@ from . import db
 HOLDOUT_VERSION = "holdout-v1-unseen-wording"
 HOLDOUT_DB = db.PROJECT_ROOT / "data" / "holdout_v1.db"
 HOLDOUT_SEAL = db.PROJECT_ROOT / "data" / "holdout_v1.seal.json"
+HOLDOUT_RESULTS = db.PROJECT_ROOT / "data" / "holdout_v1.results.json"
 
 HOLDOUT_CONFIG = {
     "version": HOLDOUT_VERSION,
@@ -202,6 +203,7 @@ def corpus_fingerprint() -> str:
 
 
 EVALUATOR_FILES = (
+    "recon/holdout.py",
     "recon/db.py",
     "recon/config.py",
     "recon/money.py",
@@ -211,6 +213,7 @@ EVALUATOR_FILES = (
     "recon/router.py",
     "recon/eval/evidence.py",
     "recon/eval/grader.py",
+    "recon/eval/paired_stats.py",
     "recon/eval/report.py",
     "recon/eval/scenarios.py",
     "recon/eval/solution.py",
@@ -680,6 +683,9 @@ def create_seal(db_path: str | Path = HOLDOUT_DB,
                 "started_at": None,
                 "finished_at": None,
                 "report": None,
+                "report_fingerprint": None,
+                "results": None,
+                "results_fingerprint": None,
                 "error": None,
             },
         }
@@ -694,6 +700,15 @@ def read_seal(seal_path: str | Path = HOLDOUT_SEAL) -> dict[str, Any]:
     if not p.exists():
         raise HoldoutError(f"缺少 holdout seal：{p}")
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _file_fingerprint(path: str | Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _artifact_path(value: str) -> Path:
+    p = Path(value)
+    return p if p.is_absolute() else db.PROJECT_ROOT / p
 
 
 def verify_seal(db_path: str | Path = HOLDOUT_DB,
@@ -720,10 +735,23 @@ def verify_seal(db_path: str | Path = HOLDOUT_DB,
         raise HoldoutError("holdout 数据库在封存后被修改")
     if value.get("summary") != summary:
         raise HoldoutError("holdout 结构摘要与封存记录不一致")
+    evaluation = value.get("evaluation") or {}
+    if evaluation.get("status") == "complete":
+        for name in ("report", "results"):
+            artifact = evaluation.get(name)
+            expected = evaluation.get(f"{name}_fingerprint")
+            if not artifact or not expected:
+                raise HoldoutError(f"完成状态缺少 {name} 审计件或指纹")
+            artifact_path = _artifact_path(artifact)
+            if not artifact_path.exists():
+                raise HoldoutError(f"holdout {name} 审计件不存在：{artifact_path}")
+            if _file_fingerprint(artifact_path) != expected:
+                raise HoldoutError(f"holdout {name} 审计件在完成后被修改")
     return value
 
 
 def set_evaluation_state(status: str, *, report: str | None = None,
+                         results: str | None = None,
                          error: str | None = None,
                          seal_path: str | Path = HOLDOUT_SEAL) -> dict[str, Any]:
     allowed = {
@@ -744,7 +772,22 @@ def set_evaluation_state(status: str, *, report: str | None = None,
         ev["finished_at"] = now
     if report is not None:
         ev["report"] = report
+        ev["report_fingerprint"] = _file_fingerprint(_artifact_path(report))
+    if results is not None:
+        ev["results"] = results
+        ev["results_fingerprint"] = _file_fingerprint(_artifact_path(results))
+    if status == "complete" and not (
+            ev.get("report_fingerprint") and ev.get("results_fingerprint")):
+        raise HoldoutError("完成状态必须同时提供报告和逐任务结果审计件")
     if error is not None:
         ev["error"] = error
     _write_json(Path(seal_path), value)
     return value
+
+
+def write_results(value: dict[str, Any],
+                  path: str | Path = HOLDOUT_RESULTS) -> Path:
+    """原子写入逐任务审计结果；它与训练归档物理分文件。"""
+    p = Path(path)
+    _write_json(p, value)
+    return p

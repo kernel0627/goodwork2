@@ -37,6 +37,7 @@ holdout 使用独立 seed、日期、公告语料和规则组合，检查受限�
 
 - `data/holdout_v1.db`
 - `data/holdout_v1.seal.json`
+- 正式运行后才会生成：`data/holdout_v1.results.json`
 
 seal 同时记录三类 SHA-256 指纹：
 
@@ -49,7 +50,7 @@ seal 同时记录三类 SHA-256 指纹：
 当前正式指纹：
 
 - 世界：`aa2e014a358265ffa2ba6580151248bb8ba9c4f97b7e3b2cd392b2d39b5cf433`
-- 评测器：`ad34656a1351480d14c28586ddd1bc8af29c3d15b4adfe90e4a14eec890b7614`
+- 评测器：`99fe3e736ee5c1e9bf73bed9db401664d73f1af592b4d6724491d71e0d0dd438`
 
 任一指纹不一致，`holdout-check` 和正式评测都会拒绝继续。构建命令发现正式数据库
 或 seal 已存在时也会拒绝覆盖。
@@ -61,7 +62,9 @@ sealed → running → complete
                  ↘ failed
 ```
 
-`complete` 和 `failed` 都不能回到 `sealed`。正式结果不会写入 SFT 轨迹归档，
+`complete` 和 `failed` 都不能回到 `sealed`。正式报告与逐任务结果会各自记录
+SHA-256 指纹，完成后任一文件被修改，`holdout-check` 都会拒绝。逐任务结果包含
+规则结论、候选结论、原始模型响应与 gold，但不会写入 SFT 轨迹归档，
 防止 holdout 输入和答案进入后续训练数据。
 
 ## 命令
@@ -83,8 +86,9 @@ CONFIRM_HOLDOUT=yes make holdout-eval
 
 ## 验收
 
-- holdout 专项：8 passed
-- 全套：185 passed, 1 skipped
+- holdout 专项：10 passed
+- 配对统计专项：9 passed
+- 全套：210 passed, 1 skipped
 - 闸门 dry-run：路由 396/1185（33.4%），需读文本召回 104/104，
   放行部分 789/789 归因 exact
 - 模型调用：0
