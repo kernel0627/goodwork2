@@ -502,6 +502,90 @@ def eval_agent_cmd(db_path: str | None, limit: int, workers: int, max_steps: int
     conn.close()
 
 
+@cli.command("route")
+@click.option("--db-path", default=None)
+@click.option("--limit", default=60, show_default=True)
+@click.option("--all-tasks", is_flag=True, help="跑全量（闸门本身零成本，只有被路由的才花钱）")
+@click.option("--workers", default=12, show_default=True)
+@click.option("--model", default=None)
+@click.option("--dry-run", is_flag=True, help="只跑闸门，不调模型 —— 先看要花多少钱")
+@click.option("--save/--no-save", default=True)
+def route_cmd(db_path: str | None, limit: int, all_tasks: bool, workers: int,
+              model: str | None, dry_run: bool, save: bool) -> None:
+    """规则优先路由 —— 规则先跑，只把它注定读不到的那部分交给 agent。
+
+    --dry-run 只跑闸门：路由比例、需读文本召回、放行部分正确率，全部零 token。
+    先看这个再决定要不要真的跑。
+    """
+    from .agent.llm import DeepSeekClient
+    from .agent.solver import run_agent
+    from .baseline.rules import RuleBaseline, run_baseline
+    from .eval import report as rp
+    from .eval.evidence import EvidenceView
+    from .eval.grader import aggregate, grade_one
+    from .eval.tasks import default_ensure, load_tasks, sample_tasks
+    from .router import RouterSolver, route_summary, run_router
+    from .world.injector import TEXT_DEPENDENT_CODES
+
+    conn = db.connect(db_path)
+    every = load_tasks(conn)
+    if not every:
+        console.print("[red]任务集为空，先跑 make build[/]")
+        return
+    tasks = every if all_tasks else sample_tasks(every, limit, ensure=default_ensure(limit))
+    n_text = sum(1 for t in tasks if set(t.gold_codes) & TEXT_DEPENDENT_CODES)
+    console.print(f"任务 [bold]{len(tasks)}[/] 条（需读自由文本 [magenta]{n_text}[/] 条）")
+
+    # ---- 闸门（零 token）----
+    ev = EvidenceView(conn)
+    gate = RouterSolver(rules=RuleBaseline())
+    rule_sols = {}
+    for t in tasks:
+        sol, _ = gate.decide(t, ev)
+        rule_sols[t.task_id] = sol
+    s = route_summary(gate.decisions)
+    routed_ids = {d.task_id for d in gate.decisions if d.routed}
+
+    kept = [t for t in tasks if t.task_id not in routed_ids]
+    kept_ok = sum(grade_one(t, rule_sols[t.task_id]).attr_exact for t in kept)
+    recall = sum(1 for t in tasks if t.task_id in routed_ids
+                 and set(t.gold_codes) & TEXT_DEPENDENT_CODES)
+
+    tb = Table(title="闸门（零 token）", show_header=False)
+    tb.add_row("路由给 agent", f"{s['routed']}/{s['total']} = {s['routed_rate']:.1%}")
+    tb.add_row("需读文本召回", f"{recall}/{n_text}" + ("  ✅" if recall == n_text else "  ❌ 会错误动账"))
+    tb.add_row("放行部分正确率", f"{kept_ok}/{len(kept)} = "
+                                 f"{kept_ok / max(1, len(kept)):.1%}")
+    console.print(tb)
+    for reason, cnt in s["by_reason"].items():
+        console.print(f"    {cnt:>4}  {reason}")
+
+    if dry_run:
+        console.print("\n[yellow]--dry-run[/] 到此为止，未调用模型。")
+        conn.close()
+        return
+
+    # ---- 只对被路由的那批跑 agent ----
+    client = DeepSeekClient(model=model)
+    console.print(f"\n模型 [cyan]{client.name}[/]，只跑被路由的 {s['routed']} 条")
+
+    def inner_run(batch):
+        sols, _ = run_agent(db_path, batch, llm=client, workers=workers)
+        return sols
+
+    sols, _ = run_router(db_path, tasks, inner_run=inner_run)
+
+    reps = [aggregate("rule_baseline", tasks, run_baseline(conn, tasks)),
+            aggregate(f"router({client.name})", tasks, sols)]
+    console.rule("[bold]规则基线 vs 规则优先路由[/]")
+    rp.print_comparison(reps)
+    if save:
+        p = DOCS / "stage4_router.md"
+        p.write_text(rp.comparison_markdown(reps, tasks=tasks), encoding="utf-8")
+        console.print(f"[green]已写入[/] {p}")
+    conn.close()
+
+
 @cli.command("variance")
 @click.option("--db-path", default=None)
 @click.option("--limit", default=60, show_default=True)

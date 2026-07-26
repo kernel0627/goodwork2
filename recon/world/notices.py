@@ -93,10 +93,11 @@ COVERING_TITLES = DELAY_TITLES | FEE_TITLES
 class NoticeBoard:
     """生成公告，并记住哪些 (渠道, 日期) 被覆盖性公告覆盖了。"""
 
-    def __init__(self, conn, seed: int, dates: list[str]):
+    def __init__(self, conn, seed: int, dates: list[str], cover_k: int = 4):
         self.conn = conn
         self.rng = random.Random(seed + 4242)
         self.dates = dates
+        self.cover_k = cover_k
         self.delay_cover: set[tuple[str, str]] = set()      # (channel_id, bill_date)
         self.fee_cover: set[tuple[str, str]] = set()
         self.rows: list[dict] = []
@@ -126,9 +127,14 @@ class NoticeBoard:
         fee_eligible = [c for c in channels
                         if CHANNELS[c].bill_basis == "gross"]                # D22 的前置条件
 
+        # ⚠️ 覆盖对的数量直接决定「需读自由文本」这一档有多少条任务，
+        #    而那一档是 agent 唯一的价值点、也是要反复测的指标。
+        #    k=2 时该档只有 14 条任务 —— 一条翻转就是 7.1 个百分点，
+        #    实测噪声下限恰好 ±7.1pp，等于这个指标**分辨不出任何小于一条任务的效应**。
+        #    要让消融实验有意义，必须先把这一档做厚。
         for cover, texts, eligible, k in (
-            (self.delay_cover, DELAY_NOTICES, delay_eligible, 2),
-            (self.fee_cover, FEE_ERROR_NOTICES, fee_eligible, 2),
+            (self.delay_cover, DELAY_NOTICES, delay_eligible, self.cover_k),
+            (self.fee_cover, FEE_ERROR_NOTICES, fee_eligible, self.cover_k),
         ):
             combos = [(c, d) for c in eligible for d in self.dates]
             picks = self.rng.sample(combos, k=min(k, len(combos)))
@@ -154,7 +160,7 @@ class NoticeBoard:
         }
 
 
-def build_notices(conn, seed: int, dates: list[str]) -> NoticeBoard:
-    board = NoticeBoard(conn, seed, dates)
+def build_notices(conn, seed: int, dates: list[str], cover_k: int = 4) -> NoticeBoard:
+    board = NoticeBoard(conn, seed, dates, cover_k=cover_k)
     board.build()
     return board
