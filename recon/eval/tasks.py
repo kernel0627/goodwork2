@@ -55,7 +55,18 @@ class Task:
 
 def load_tasks(conn, *, limit: int | None = None,
                only_codes: set[str] | None = None,
-               only_composite: bool = False) -> list[Task]:
+               only_composite: bool = False,
+               split: str = "all") -> list[Task]:
+    """split:
+         all   全部
+         text  判据只在自由文本里的（D21/D22）—— agent 唯一的价值点
+         rule  判据在结构化数据里的
+
+    ⭐ 为什么要分档跑：把 text 档当混合样本的一个切片，它的样本量就被采样配额
+       压到十几条，一条翻转 5~7 个百分点，什么效应都分辨不出来。
+       该档必须作为**独立实验**跑全量。
+    """
+    from ..world.injector import TEXT_DEPENDENT_CODES
     sql = """
         SELECT d.id, d.channel_id, d.bill_date, d.source, d.channel_txn_no,
                d.our_ref_type, d.our_ref_id, d.diff_cents, d.fee_delta_cents,
@@ -70,6 +81,11 @@ def load_tasks(conn, *, limit: int | None = None,
         if only_composite and not r["is_composite"]:
             continue
         if only_codes and not (set(codes) & only_codes):
+            continue
+        is_text = bool(set(codes) & TEXT_DEPENDENT_CODES)
+        if split == "text" and not is_text:
+            continue
+        if split == "rule" and is_text:
             continue
         group = (f"{r['channel_id']}:{r['channel_txn_no']}" if r["channel_txn_no"]
                  else f"{r['our_ref_type']}:{r['our_ref_id']}")

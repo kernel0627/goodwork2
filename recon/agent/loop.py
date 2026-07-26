@@ -21,7 +21,7 @@ from ..eval.tasks import Task
 from ..world.injector import ALL_ACTIONS, CODES
 from . import prompts
 from .config import AgentConfig, V1
-from .llm import LLMClient, LLMError, Usage
+from .llm import LLMClient, LLMError, LLMFatalError, Usage
 from .tools import ToolBox, digest
 
 VALID_STATUS = ("closed", "held", "escalated")
@@ -64,7 +64,7 @@ class AgentRunner:
     # ------------------------------------------------------------------
     def run(self, task: Task, ev: EvidenceView) -> RunResult:
         ev.reset_trace()
-        box = ToolBox(ev)
+        box = ToolBox(ev, strip_injection_policy=self.cfg.strip_injection_policy)
         t_start = time.time()
 
         messages: list[dict] = [
@@ -83,6 +83,10 @@ class AgentRunner:
         for i in range(1, self.max_steps + 1):
             try:
                 decision, u = self.llm.complete_json(messages)
+            except LLMFatalError:
+                # 余额/密钥问题不是「这条任务失败」，是整批都跑不了。
+                # 吞成 UNKNOWN 会让报表看起来像模型能力差，必须让它炸出来。
+                raise
             except LLMError as e:
                 stop_reason = "llm_error"
                 steps.append(Step(i, thought=f"模型调用失败：{e}", ok=False))
@@ -159,6 +163,8 @@ class AgentRunner:
         msgs = messages + [{"role": "user", "content": prompts.FORCE_CONCLUDE}]
         try:
             decision, u = self.llm.complete_json(msgs)
+        except LLMFatalError:
+            raise
         except LLMError as e:
             return ({}, Usage(), Step(0, thought=f"强制收敛失败：{e}", ok=False))
         step = Step(0, thought=str(decision.get("thought", ""))[:400],

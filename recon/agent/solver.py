@@ -16,7 +16,7 @@ from ..eval.evidence import EvidenceView
 from ..eval.solution import Solution
 from ..eval.tasks import Task
 from .config import AgentConfig, V1
-from .llm import DeepSeekClient, LLMClient
+from .llm import DeepSeekClient, LLMClient, LLMFatalError
 from .loop import AgentRunner, RunResult
 
 
@@ -68,11 +68,17 @@ def run_agent(db_path: str | Path | None, tasks: Iterable[Task], *,
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(work, t): t for t in tasks}
-            for i, fut in enumerate(as_completed(futs), 1):
-                r = fut.result()
-                results.append(r)
-                if progress:
-                    progress(i, len(tasks), r)
+            try:
+                for i, fut in enumerate(as_completed(futs), 1):
+                    r = fut.result()
+                    results.append(r)
+                    if progress:
+                        progress(i, len(tasks), r)
+            except LLMFatalError:
+                # 永久性错误：立刻取消剩余任务，别把额度和时间烧在必然失败上
+                for f in futs:
+                    f.cancel()
+                raise
 
     results.sort(key=lambda r: r.task_id)
     return {r.task_id: r.solution for r in results}, results

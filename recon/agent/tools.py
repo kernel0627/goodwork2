@@ -90,8 +90,11 @@ def _budget(rows: list, n: int = MAX_ROWS, hint: str = "") -> dict:
 # --------------------------------------------------------------------------
 
 class ToolBox:
-    def __init__(self, ev: EvidenceView):
+    def __init__(self, ev: EvidenceView, *, strip_injection_policy: bool = False):
         self.ev = ev
+        # 剥离对照组必须在**所有**读到 SOP 的路径上生效，否则模型一个
+        # read_policy 就把剥掉的章节读回来了，对照组照旧不成立。
+        self.strip_injection_policy = strip_injection_policy
         self._tools: dict[str, Tool] = {}
         self._register_all()
 
@@ -298,9 +301,13 @@ class ToolBox:
 
     def read_policy(self, name: str) -> dict:
         try:
-            return {"name": name, "content": self.ev.policy(name)}
+            content = self.ev.policy(name)
         except EvidenceAccessError as e:
             raise NotFound(str(e))
+        if self.strip_injection_policy and name == "diff_sop":
+            from .prompts import _sop_text
+            content = _sop_text(strip_injection=True)
+        return {"name": name, "content": content}
 
     def compute_standard_fee(self, channel_id: str, gross_cents: int) -> dict:
         try:

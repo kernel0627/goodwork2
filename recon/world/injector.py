@@ -139,6 +139,34 @@ class Injector:
     def _fee_covered(self, channel_id: str, bill_date: str) -> bool:
         return bool(self.board) and (channel_id, bill_date) in self.board.fee_cover
 
+    def _our_bill_date(self, pay_id: str, channel_id: str) -> str | None:
+        """我方支付单按日切算出来的账单日 —— 差错最终落在这一天。"""
+        from .generator import bill_date_for
+        row = db.q1(self.conn, "SELECT paid_at FROM payments WHERE id=?", (pay_id,))
+        if row is None or not row["paid_at"]:
+            return None
+        return bill_date_for(datetime.fromisoformat(row["paid_at"]),
+                             CHANNELS[channel_id].cutoff_minutes).isoformat()
+
+    def _covered_on_any_side(self, kind: str, row) -> bool:
+        """公告覆盖判定必须同时看两个日期。
+
+        ⚠️ D09/D14 会把渠道记录搬到别的账单日，于是「渠道记录所在的日」和
+           「差错最终落在的日（= 我方记录的账单日）」不再相等。
+           守卫只查前者时，复合差错 (D09,D05) 就会被标成 D05，
+           而它实际落在一个有费率公告的日子上 —— 从可见证据看正确答案是 D22。
+           实测这样产生了 9 条不可解标注。
+        """
+        cover = self.board.fee_cover if kind == "fee" else self.board.delay_cover
+        if not self.board:
+            return False
+        dates = {row["bill_date"]}
+        if "pay_id" in row.keys():
+            d = self._our_bill_date(row["pay_id"], row["channel_id"])
+            if d:
+                dates.add(d)
+        return any((row["channel_id"], d) in cover for d in dates)
+
     # ------------------------------------------------------------- helpers
     def _group(self) -> str:
         self._gid += 1
@@ -239,7 +267,7 @@ class Injector:
         ⚠️ 该 (渠道,日期) 若被延迟下发公告覆盖，正确答案就是 D21 而不是 D01，
            在这里注入会造成两类标注互相污染。
         """
-        if self._delay_covered(row["channel_id"], row["bill_date"]):
+        if self._covered_on_any_side("delay", row):
             return False
         self.conn.execute("DELETE FROM channel_bill_records WHERE id=?", (row["rec_id"],))
         self._record("D01", channel_id=row["channel_id"], bill_date=row["bill_date"],
@@ -313,8 +341,9 @@ class Injector:
 
     def _d05(self, row, gid: str) -> bool:
         """我方误按协议费率记账 -> 手续费维度差。"""
-        # 该 (渠道,日期) 若被费率误用公告覆盖，正确答案是 D22 而不是 D05
-        if self._fee_covered(row["channel_id"], row["bill_date"]):
+        # 该 (渠道,日期) 若被费率误用公告覆盖，正确答案是 D22 而不是 D05。
+        # 两侧日期都要查 —— 见 _covered_on_any_side 的说明。
+        if self._covered_on_any_side("fee", row):
             return False
         merchant = MERCHANTS.get(row["merchant_id"])
         override = merchant.fee_override.get(row["channel_id"]) if merchant else None

@@ -179,4 +179,7 @@ class GenerateConfig:
     partial_refund_ratio: float = 0.45  # 退款里多少是部分退款
     fail_ratio: float = 0.06            # 支付失败比例
     inject_count_per_day: int = 120     # 每天注入多少条差错
-    composite_ratio: float = 0.25       # 注入里多少是复合差错
+    # 复合占比。公告覆盖守卫收紧后，(D09,D05)/(D14,D05) 在被费率公告覆盖的
+    # 日期上会被正确拒掉，成功率下降 —— 提高尝试配额来补，
+    # 而不是去挪「复合 ≥60 条」那个测试门槛。
+    composite_ratio: float = 0.34

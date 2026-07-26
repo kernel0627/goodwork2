@@ -444,10 +444,15 @@ def test_d22_has_a_covering_fee_notice(cases, world):
 
 
 def test_d01_is_not_covered_by_a_delay_notice(cases, world):
-    """反向守卫：D01 若落在有延迟公告的日子上，正确答案其实是 D21，两类会互相污染。"""
+    """反向守卫：D01 若落在有延迟公告的日子上，正确答案其实是 D21，两类会互相污染。
+
+    ⚠️ 必须用 _containing（含复合）。只查原子是这个项目里犯了三次的同一个错：
+       D03 落到四舍五入渠道、D04 落到 gross 口径渠道、D05 落到费率公告覆盖的日子，
+       三次都是复合路径绕过了原子路径的守卫。
+    """
     from recon.world.notices import DELAY_TITLES
     bad = []
-    for c in _atomic(cases, "D01"):
+    for c in _containing(cases, "D01"):
         d = c["diff"]
         titles = _covering_notice_titles(world, d["channel_id"], d["bill_date"])
         if titles & DELAY_TITLES:
@@ -458,12 +463,14 @@ def test_d01_is_not_covered_by_a_delay_notice(cases, world):
 def test_d05_is_not_covered_by_a_fee_notice(cases, world):
     from recon.world.notices import FEE_TITLES
     bad = []
-    for c in _atomic(cases, "D05"):
+    for c in _containing(cases, "D05"):
         d = c["diff"]
         titles = _covering_notice_titles(world, d["channel_id"], d["bill_date"])
         if titles & FEE_TITLES:
-            bad.append(f"{d['id']} 标 D05，但当日有费率误用公告，应判 D22")
-    assert not bad, "D05 与 D22 标注互相污染：\n" + "\n".join(bad[:10])
+            bad.append(f"{d['id']} {c['substantive']} 标了 D05，但差错所在账单日 "
+                       f"{d['bill_date']} 有费率误用公告 —— 从可见证据看应判 D22")
+    assert not bad, ("D05 与 D22 标注互相污染（复合路径绕过了守卫）：\n"
+                     + "\n".join(bad[:10]))
 
 
 def test_distractor_notices_exist(world):

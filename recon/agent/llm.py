@@ -95,6 +95,31 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMFatalError(LLMError):
+    """永久性错误：余额不足、密钥无效、无权限。
+
+    ⚠️ 这类错误重试是纯浪费，而且会掩盖问题：
+       账户余额耗尽时，59 条任务 × 9 轮全部退化成 UNKNOWN，
+       报表上看起来像「模型能力差」，实际是账户没钱了。
+       必须快速失败并中止整批，而不是安静地产出一堆兜底答案。
+    """
+
+
+# HTTP 状态码里属于「重试没用」的那些
+FATAL_STATUS = {400, 401, 402, 403, 404, 422}
+
+
+def _is_fatal(exc: Exception) -> bool:
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(code, int) and code in FATAL_STATUS:
+        return True
+    text = str(exc).lower()
+    return any(k in text for k in (
+        "insufficient balance", "invalid api key", "authentication",
+        "quota exceeded", "permission denied", "error code: 402",
+        "error code: 401", "error code: 403"))
+
+
 class LLMClient(Protocol):
     name: str
 
@@ -143,8 +168,11 @@ class DeepSeekClient:
                     model=self.model, messages=messages,
                     response_format={"type": "json_object"},
                     temperature=temperature, max_tokens=budget)
-            except Exception as e:                       # 网络/限流：退避重试
-                last = e
+            except Exception as e:
+                if _is_fatal(e):
+                    # 余额/密钥/权限问题，重试无意义，直接向上抛
+                    raise LLMFatalError(f"永久性错误，重试无意义：{e}") from e
+                last = e                                  # 网络/限流：退避重试
                 time.sleep(min(2 ** attempt, 8))
                 continue
             latency = int((time.time() - t0) * 1000)

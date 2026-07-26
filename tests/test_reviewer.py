@@ -12,6 +12,7 @@ from recon.agent.llm import FakeLLM, LLMError
 from recon.agent.reviewer import (OVERRIDE, NoticeReviewer, _apply_override,
                                   review_stats)
 from recon.baseline.rules import RuleBaseline
+from recon import db
 from recon.eval.evidence import EvidenceView
 from recon.eval.solution import Solution
 from recon.eval.tasks import load_tasks
@@ -125,14 +126,31 @@ def test_reviewer_falls_back_to_the_rule_on_llm_failure(world):
 
 
 def test_reviewer_sees_notice_bodies_but_not_the_answer(world):
+    """复核器能看到公告正文，但不能看到「本条的答案」。
+
+    ⚠️ 要区分两件事，混在一起会误报：
+      - **输出词表**：提示词里必须写明「有覆盖性公告就改判为 D21/D22，否则维持」，
+        否则模型不知道自己被允许输出什么。每条被路由的任务拿到的是同一句话，
+        它没有告诉模型这一条究竟是哪个 —— 这不是泄漏。
+      - **本条的答案**：答案表里的 explanation、注入登记、公告的分类结论，
+        任何一样都不能出现。这才是泄漏。
+    """
     task, prior = _routed_task(world)
     llm = FakeLLM([_not_covered()])
     NoticeReviewer(llm).solve(task, EvidenceView(world), prior=prior)
     prompt = llm.seen[0][1]["content"]
     assert "公告" in prompt and str(task.diff_id) in prompt
-    for leaked in task.gold_codes:
-        if leaked not in prior.root_causes:
-            assert leaked not in prompt, f"提示词里泄漏了答案 {leaked}"
+
+    conn = world
+    g = db.q1(conn, "SELECT explanation FROM diff_ground_truth WHERE diff_id=?",
+              (task.diff_id,))
+    if g and g["explanation"]:
+        # 答案里那段解释的任何实质片段都不许出现
+        for frag in [x for x in g["explanation"].split("。") if len(x) > 12]:
+            assert frag not in prompt, f"提示词里泄漏了答案解释：{frag[:40]}"
+    for banned in ("root_causes", "correct_actions", "expected_status",
+                   "injections", "diff_ground_truth"):
+        assert banned not in prompt, f"提示词里出现了答案字段名 {banned}"
 
 
 def test_reviewer_charges_its_own_call(world):
