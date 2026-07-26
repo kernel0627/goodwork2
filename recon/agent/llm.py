@@ -242,6 +242,9 @@ def resolve_model_config(model: str | None = None, *,
             key = key or "local-no-key"
 
     endpoint = _normalise_local_base(provider, endpoint)
+    if endpoint and urlparse(endpoint).scheme not in {"http", "https"}:
+        raise LLMError(
+            f"模型端点必须是 http(s) URL，收到 {endpoint!r}")
     if key is None and _is_local_url(endpoint):
         key = "local-no-key"
     if key is None:
@@ -419,7 +422,7 @@ def _usage_from_response(response, pricing: Pricing, latency_ms: int) -> Usage:
         calls=1, tokens_in=prompt, tokens_out=completion,
         cached_in=hit, reasoning_out=reasoning, latency_ms=latency_ms,
         cost_micro_cny=pricing.cost_micro_cny(miss, hit, completion),
-        priced=pricing.configured)
+        priced=pricing.configured and raw is not None)
 
 
 class OpenAICompatibleClient:
@@ -522,7 +525,15 @@ class OpenAICompatibleClient:
                 continue
             choice = choices[0]
             content = getattr(getattr(choice, "message", None), "content", "")
-            text = content if isinstance(content, str) else str(content or "")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    str(item.get("text", "")) if isinstance(item, dict)
+                    else str(getattr(item, "text", ""))
+                    for item in content)
+            else:
+                text = str(content or "")
             if not text.strip():
                 last = LLMError(
                     f"响应正文为空（finish_reason={getattr(choice, 'finish_reason', None)}，"

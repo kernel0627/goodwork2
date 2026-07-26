@@ -130,6 +130,15 @@ def test_generic_local_endpoint_needs_no_key():
     assert cfg.api_key == "local-no-key"
 
 
+def test_invalid_endpoint_gets_a_clear_error():
+    with pytest.raises(LLMError, match=r"http\(s\) URL"):
+        resolve_model_config(env={
+            "RECON_LLM_BASE_URL": "gateway.example/v1",
+            "RECON_LLM_API_KEY": "key",
+            "RECON_LLM_MODEL": "model",
+        })
+
+
 def test_safe_config_never_exposes_full_key():
     cfg = _config(api_key="super-secret-api-key")
     safe = cfg.safe_dict()
@@ -170,6 +179,24 @@ def test_token_and_temperature_parameters_adapt():
     assert calls.calls[-1]["max_completion_tokens"] == 321
     assert "max_tokens" not in calls.calls[-1]
     assert "temperature" not in calls.calls[-1]
+
+
+def test_missing_usage_is_tolerated_but_not_claimed_as_priced():
+    response = SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=[{"text": "{\"ok\": true}"}]),
+            finish_reason="stop")],
+    )
+    fake, _ = _fake_client(response)
+    client = OpenAICompatibleClient(
+        config=_config(), client=fake, pricing=Pricing(1, 1, 1))
+    value, usage = client.complete_json(
+        [{"role": "user", "content": "json"}])
+
+    assert value == {"ok": True}
+    assert usage.tokens_in == usage.tokens_out == 0
+    assert usage.priced is False
 
 
 def test_authentication_error_does_not_get_disguised_as_compatibility_fallback():
